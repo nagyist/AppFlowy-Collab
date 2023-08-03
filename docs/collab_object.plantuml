@@ -1,0 +1,128 @@
+@startuml
+'left to right direction
+package "AppFlowy Application" as appflowy {
+  [flowy-folder]
+  [flowy-database]
+  [flowy-document]
+}
+
+component "Collab" as collab {
+  [Folder]
+  [Database]
+  [Document]
+}
+
+component "CollabPlugins" as plugins {
+  [RocksdbDiskPlugin]
+  [SupabaseDBPlugin]
+}
+
+
+cloud "Supabase Cloud" as supabase {
+}
+
+database "rocksdb" as rocksdb {
+}
+
+database "postgres" as postgres {
+}
+
+[flowy-folder] --> [Folder]
+[flowy-database] --> [Database]
+[flowy-document] --> [Document]
+
+collab --> plugins
+RocksdbDiskPlugin --> rocksdb
+SupabaseDBPlugin --> supabase
+supabase --> postgres
+@enduml
+
+@startuml
+title Create Document
+actor User as user
+participant flowy_folder as folder
+participant flowy_document as fd
+participant collab_document as cd
+participant plugins as plugins
+participant RocksdbDiskPlugin as rdb
+participant SupabaseDBPlugin as supabase
+
+user --> folder: 1.create a document
+folder --> fd
+fd --> cd : 2.create document collab object
+cd --> plugins
+plugins --> plugins : 3.propagate the updates to all plugins
+plugins --> rdb : 4.save the updates to disk
+plugins --> supabase : 5.send the updates to server
+@enduml
+
+
+
+@startuml
+title Open Document
+actor User as user
+participant flowy_document as fd
+participant collab_document as cd
+participant plugins as plugins
+participant SupabaseDBPlugin as supabase
+
+user --> fd: 1. open
+fd --> cd
+cd --> plugins
+plugins --> plugins : 2. call did_init method of all plugins
+plugins --> supabase : 3. send init sync request to server
+supabase --> plugins : 4. receive init sync response from server
+@enduml
+
+@startuml
+title Edit Document
+actor User as user
+participant flowy_document as fd
+participant collab_document as cd
+collections plugins as plugins
+participant RocksdbDiskPlugin as rdb
+participant SupabaseDBPlugin as supabase_plugin
+participant SupabaseCloud as supabase
+
+user --> fd: 1. type 'abc'
+fd --> cd : 2. create a update containing 'abc'
+cd --> plugins
+plugins --> rdb
+rdb --> rdb: 4.save updates
+plugins --> supabase_plugin
+supabase_plugin --> supabase_plugin: 5. push updates to send queue
+supabase_plugin --> supabase
+@enduml
+
+
+@startuml
+title Sync Document
+actor User1 as user1
+actor User2 as user2
+actor User3 as user3
+participant Collab as collab
+collections plugins as plugins
+participant SupabaseDBPlugin as supabase_plugin
+participant SupabaseCloud as supabase
+
+== Generate updates ==
+user1 --> collab: 1. type 'abc'
+collab --> collab : 2. create a update containing 'abc'
+collab --> plugins
+plugins --> supabase_plugin
+supabase_plugin --> supabase: 3. send the update to server
+supabase --> supabase_plugin: 4. ack the update is send
+
+== broadcast the update to all clients ==
+supabase --> Realtime: 5. broadcast the update
+
+== User2 receives the updates ==
+Realtime --> user2: 6. receive the update
+user2 --> collab: 7. apply the update
+collab --> user2: 8.refresh the UI
+
+== User3 receives the updates ==
+Realtime --> user3: 6receive the update
+user3 --> collab: 7.apply the update
+collab --> user3: 8. refresh the UI
+@enduml
