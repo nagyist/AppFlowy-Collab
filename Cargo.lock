@@ -654,7 +654,6 @@ dependencies = [
  "bytes",
  "chrono",
  "collab",
- "collab-derive",
  "lib0",
  "nanoid",
  "parking_lot 0.12.1",
@@ -749,7 +748,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collab",
- "collab-derive",
  "collab-persistence",
  "collab-plugins",
  "nanoid",
@@ -773,7 +771,6 @@ dependencies = [
  "assert-json-diff",
  "chrono",
  "collab",
- "collab-derive",
  "collab-persistence",
  "collab-plugins",
  "fs_extra",

@@ -1,18 +1,17 @@
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use collab::error::CollabError;
 use collab::preclude::CollabPlugin;
 use collab_persistence::doc::YrsDocAction;
 use collab_persistence::kv::rocks_kv::RocksCollabDB;
-use collab_sync::server::CollabId;
 use y_sync::awareness::Awareness;
 use yrs::TransactionMut;
 
 #[derive(Clone)]
 pub struct RocksdbServerDiskPlugin {
-  collab_id: CollabId,
+  collab_id: i64,
   db: Arc<RocksCollabDB>,
   did_load: Arc<AtomicBool>,
 }
@@ -26,7 +25,7 @@ impl Deref for RocksdbServerDiskPlugin {
 }
 
 impl RocksdbServerDiskPlugin {
-  pub fn new(collab_id: CollabId, db: Arc<RocksCollabDB>) -> Result<Self, CollabError> {
+  pub fn new(collab_id: i64, db: Arc<RocksCollabDB>) -> Result<Self, CollabError> {
     let did_load = Arc::new(AtomicBool::new(false));
     Ok(Self {
       collab_id,

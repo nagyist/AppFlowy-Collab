@@ -5,9 +5,11 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 collab = { path = "../collab" }
-collab-derive = { path = "../collab-derive" }
 collab-persistence = { path = "../collab-persistence" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.94"

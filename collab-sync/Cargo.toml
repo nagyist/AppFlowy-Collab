@@ -5,13 +5,16 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 yrs = "0.16.5"
 y-sync = { version = "0.3.1" }
 collab = { path = "../collab" }
 lib0 = "0.16.3"
 futures-util = { version = "0.3", features = ["sink"] }
-tokio = { version = "1.26.0", features = ["net", "sync", "macros"] }
+tokio = { version = "1.26.0", features = ["sync", "macros"] }
 parking_lot = "0.12.1"
 tracing = { version = "0.1" }
 thiserror = "1.0.39"
@@ -23,5 +26,7 @@ bytes = "1.4"
 tokio-stream = { version = "0.1.14" }
 
 [dev-dependencies]
-tokio = { version = "1.26.0", features = ["full"] }
+tokio = { version = "1.26.0", features = ["sync", "rt"] }
 
+[features]
+appflowy_cloud = ["tokio/net"]
