@@ -1,5 +1,3 @@
-use collab::core::any_map::AnyMapExtension;
-
 use crate::database_test::helper::{create_database_with_default_data, DatabaseTest};
 use crate::helper::{TestFieldType, TestFilter, FILTER_CONTENT};
 
@@ -19,10 +17,10 @@ async fn create_database_view_with_filter_test() {
 
 #[tokio::test]
 async fn insert_or_update_database_view_filter_test() {
-  let database_test = create_database_with_two_filters().await;
+  let mut database_test = create_database_with_two_filters().await;
   // Update
   database_test.update_filter("v1", "filter_1", |update| {
-    update.insert_str_value(FILTER_CONTENT, "Text filter".to_string());
+    update.insert(FILTER_CONTENT.into(), "Text filter".into());
   });
 
   let filter_1 = database_test
@@ -49,20 +47,10 @@ async fn insert_or_update_database_view_filter_test() {
 }
 
 #[tokio::test]
-async fn get_database_view_filter_by_field_id_test() {
-  let database_test = create_database_with_two_filters().await;
-  let filter_1 = database_test
-    .get_filter_by_field_id::<TestFilter>("v1", "f1")
-    .unwrap();
-  assert_eq!(filter_1.content, "hello filter");
-}
+async fn insert_database_view_filter_to_filtering_field_id_test() {
+  let mut database_test = create_database_with_two_filters().await;
 
-#[tokio::test]
-async fn insert_database_view_filter_with_occupied_field_id_test() {
-  let database_test = create_database_with_two_filters().await;
-
-  // The field id "f1" is already occupied by existing filter. So this filter
-  // will be ignored
+  // Filter with id "filter_1" already filters based on "f1"
   database_test.insert_filter(
     "v1",
     TestFilter {
@@ -70,26 +58,27 @@ async fn insert_database_view_filter_with_occupied_field_id_test() {
       field_id: "f1".to_string(),
       field_type: Default::default(),
       condition: 0,
-      content: "Override the existing filter".to_string(),
+      content: "Another filter".to_string(),
     },
   );
 
-  let filter_1 = database_test
-    .get_filter_by_field_id::<TestFilter>("v1", "f1")
+  let filter_3 = database_test
+    .get_filter::<TestFilter>("v1", "filter_3")
     .unwrap();
-  assert_eq!(filter_1.content, "hello filter");
+  assert_eq!(filter_3.content, "Another filter");
 }
 
 #[tokio::test]
 async fn remove_database_view_filter_test() {
-  let database_test = create_database_with_two_filters().await;
+  let mut database_test = create_database_with_two_filters().await;
   database_test.remove_filter("v1", "filter_1");
   let filter_1 = database_test.get_filter::<TestFilter>("v1", "filter_1");
   assert!(filter_1.is_none());
 }
 
 async fn create_database_with_two_filters() -> DatabaseTest {
-  let database_test = create_database_with_default_data(1, "1").await;
+  let database_id = uuid::Uuid::new_v4();
+  let mut database_test = create_database_with_default_data(1, &database_id.to_string()).await;
   let filter_1 = TestFilter {
     id: "filter_1".to_string(),
     field_id: "f1".to_string(),

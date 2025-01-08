@@ -1,211 +1,125 @@
-use std::panic;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::local_storage::kv::doc::CollabKVAction;
-use crate::local_storage::kv::snapshot::{CollabSnapshot, SnapshotAction, SnapshotPersistence};
-use crate::local_storage::kv::PersistenceError;
+use crate::local_storage::kv::snapshot::SnapshotPersistence;
+use crate::local_storage::kv::{KVTransactionDB, PersistenceError};
 use crate::CollabKVDB;
-use collab::preclude::{Collab, CollabPlugin};
-use collab_entity::CollabObject;
-use parking_lot::RwLock;
-use similar::{ChangeTag, TextDiff};
-use yrs::updates::decoder::Decode;
-use yrs::{ReadTxn, StateVector, TransactionMut, Update};
+use collab::preclude::Collab;
+use collab_entity::CollabType;
 
-#[derive(Clone, Debug)]
-enum GenSnapshotState {
-  Idle,
-  Processing,
-  Fail,
+use yrs::{ReadTxn, StateVector};
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotState {
+  Idle = SnapshotState::IDLE,
+  Processing = SnapshotState::PROCESSING,
+  Fail = SnapshotState::FAIL,
 }
 
-impl GenSnapshotState {
-  fn is_idle(&self) -> bool {
-    matches!(self, Self::Idle)
-  }
+impl SnapshotState {
+  const IDLE: u8 = 0;
+  const PROCESSING: u8 = 1;
+  const FAIL: u8 = 2;
+}
 
-  fn is_fail(&self) -> bool {
-    matches!(self, Self::Fail)
+impl TryFrom<u8> for SnapshotState {
+  type Error = u8;
+
+  #[inline]
+  fn try_from(value: u8) -> Result<Self, Self::Error> {
+    match value {
+      SnapshotState::IDLE => Ok(SnapshotState::Idle),
+      SnapshotState::PROCESSING => Ok(SnapshotState::Processing),
+      SnapshotState::FAIL => Ok(SnapshotState::Fail),
+      _ => Err(value),
+    }
   }
 }
 
-pub struct CollabSnapshotPlugin {
-  uid: i64,
-  object: CollabObject,
-  collab_db: Weak<CollabKVDB>,
-  /// the number of updates on disk when opening the document
-  update_count: Arc<AtomicU32>,
-  snapshot_per_update: u32,
-  state: Arc<RwLock<GenSnapshotState>>,
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct CollabSnapshot {
+  state: Arc<AtomicU8>,
   snapshot_persistence: Arc<dyn SnapshotPersistence>,
 }
 
-impl CollabSnapshotPlugin {
-  pub fn new(
-    uid: i64,
-    object: CollabObject,
-    snapshot_persistence: Arc<dyn SnapshotPersistence>,
-    collab_db: Weak<CollabKVDB>,
-    snapshot_per_update: u32,
-  ) -> Self {
-    let state = Arc::new(RwLock::new(GenSnapshotState::Idle));
-    let initial_update_count = Arc::new(AtomicU32::new(0));
+#[allow(dead_code)]
+impl CollabSnapshot {
+  pub fn new(snapshot_persistence: Arc<dyn SnapshotPersistence>) -> Self {
+    let state = Arc::new(AtomicU8::new(SnapshotState::IDLE));
     Self {
-      uid,
       snapshot_persistence,
-      object,
-      collab_db,
-      update_count: initial_update_count,
-      snapshot_per_update,
       state,
     }
   }
 
-  /// Return the snapshots for the given object id
-  pub fn get_snapshots(&self, object_id: &str) -> Vec<CollabSnapshot> {
-    self.snapshot_persistence.get_snapshots(self.uid, object_id)
-  }
-}
-
-impl CollabPlugin for CollabSnapshotPlugin {
-  fn after_transaction(&self, _object_id: &str, _txn: &mut TransactionMut) {
-    // After each transaction, we increment the update count
-    let old_value = self.update_count.fetch_add(1, Ordering::SeqCst);
-
-    // If the number of updates is greater than the threshold, we generate a snapshot
-    // and push it to the database. If the state is fail, which means the previous snapshot
-    // generation failed, we try to generate a new snapshot again on the next transaction.
-    let should_create_snapshot = old_value != 0 && (old_value + 1) % self.snapshot_per_update == 0;
-    let state = self.state.read().clone();
-    if should_create_snapshot || state.is_fail() {
-      let is_ready = state.is_fail() || state.is_idle();
-      if is_ready {
-        *self.state.write() = GenSnapshotState::Processing;
-        let weak_collab_db = self.collab_db.clone();
-        let weak_state = Arc::downgrade(&self.state);
-        let weak_snapshot_persistence = Arc::downgrade(&self.snapshot_persistence);
-        let uid = self.uid;
-        let object = self.object.clone();
-
-        // We use a blocking task to generate the snapshot
-        tokio::spawn(async move {
-          let _ = tokio::task::spawn_blocking(move || {
-            if let (Some(state), Some(collab_db), Some(snapshot_persistence)) = (
-              weak_state.upgrade(),
-              weak_collab_db.upgrade(),
-              weak_snapshot_persistence.upgrade(),
-            ) {
-              let snapshot_collab = Collab::new(uid, object.object_id.clone(), "1", vec![]);
-              let mut txn = snapshot_collab.origin_transact_mut();
-              if let Err(e) =
-                collab_db
-                  .read_txn()
-                  .load_doc_with_txn(uid, &object.object_id, &mut txn)
-              {
-                tracing::error!("{} snapshot generation failed: {}", object.object_id, e);
-                *state.write() = GenSnapshotState::Fail;
-                return Ok::<(), PersistenceError>(());
-              }
-              drop(txn);
-
-              // Generate the snapshot
-              let txn = snapshot_collab.transact();
-              let snapshot_data = txn.encode_state_as_update_v1(&StateVector::default());
-              match snapshot_persistence.create_snapshot(
-                uid,
-                &object.object_id,
-                object.collab_type.to_string(),
-                snapshot_data,
-              ) {
-                Ok(_) => *state.write() = GenSnapshotState::Idle,
-                Err(e) => {
-                  tracing::error!("{} snapshot generation failed: {}", object.object_id, e);
-                  *state.write() = GenSnapshotState::Fail;
-                },
-              }
-            }
-            Ok::<(), PersistenceError>(())
-          })
-          .await;
-        });
-      }
-    }
-  }
-}
-
-impl SnapshotPersistence for Arc<CollabKVDB> {
-  fn get_snapshots(&self, uid: i64, object_id: &str) -> Vec<CollabSnapshot> {
-    self.read_txn().get_snapshots(uid, object_id)
+  #[inline]
+  fn swap_state(&self, state: SnapshotState) -> SnapshotState {
+    let old = self.state.swap(state as u8, Ordering::Release);
+    SnapshotState::try_from(old).unwrap()
   }
 
-  fn create_snapshot(
+  pub(crate) fn should_create_snapshot(&self) -> bool {
+    let old = self.swap_state(SnapshotState::Processing);
+    old != SnapshotState::Processing
+  }
+
+  pub(crate) fn create_snapshot(
     &self,
+    weak_collab_db: Weak<CollabKVDB>,
     uid: i64,
     object_id: &str,
-    _title: String,
-    snapshot_data: Vec<u8>,
+    collab_type: &CollabType,
+  ) {
+    let weak_snapshot_persistence = Arc::downgrade(&self.snapshot_persistence);
+    let object_id = object_id.to_string();
+    let collab_type = collab_type.clone();
+    let state = self.state.clone();
+
+    if let (Some(db), Some(persistence)) = (
+      weak_collab_db.upgrade(),
+      weak_snapshot_persistence.upgrade(),
+    ) {
+      tokio::spawn(async move {
+        if let Err(err) =
+          Self::try_snapshot(db, persistence, uid, object_id, collab_type, state).await
+        {
+          tracing::error!("failed to create snapshot: {}", err);
+        }
+      });
+    }
+  }
+
+  async fn try_snapshot(
+    db: Arc<CollabKVDB>,
+    persistence: Arc<dyn SnapshotPersistence>,
+    uid: i64,
+    object_id: String,
+    collab_type: CollabType,
+    state: Arc<AtomicU8>,
   ) -> Result<(), PersistenceError> {
-    self.with_write_txn(|txn| {
-      txn.create_snapshot_with_data(uid, object_id, snapshot_data)?;
+    let result: Result<(), PersistenceError> = tokio::task::spawn_blocking(move || {
+      let mut collab = Collab::new(uid, object_id.clone(), "1", vec![], false);
+      db.read_txn()
+        .load_doc_with_txn(uid, &object_id, &mut collab.transact_mut())?;
+
+      // Generate the snapshot
+      let txn = collab.transact();
+      let encoded_v1 = txn.encode_state_as_update_v1(&StateVector::default());
+      persistence.create_snapshot(uid, &object_id, &collab_type, encoded_v1)?;
       Ok(())
     })
-  }
-}
+    .await
+    .unwrap();
 
-pub fn calculate_snapshot_diff(
-  uid: i64,
-  object_id: &str,
-  old_snapshot: &[u8],
-  new_snapshot: &[u8],
-) -> Result<String, anyhow::Error> {
-  if old_snapshot.is_empty() {
-    return Ok("".to_string());
-  }
-
-  if new_snapshot.is_empty() {
-    return Err(anyhow::anyhow!(
-      "The new {} snapshot data is empty",
-      object_id
-    ));
-  }
-
-  let old = try_decode_snapshot(uid, object_id, old_snapshot)?;
-  let new = try_decode_snapshot(uid, object_id, new_snapshot)?;
-
-  let mut display_str = String::new();
-  let diff = TextDiff::from_lines(&old, &new);
-  for change in diff.iter_all_changes() {
-    let sign = match change.tag() {
-      ChangeTag::Delete => "-",
-      ChangeTag::Insert => "+",
-      ChangeTag::Equal => " ",
+    let next_state = if result.is_ok() {
+      SnapshotState::Idle
+    } else {
+      SnapshotState::Fail
     };
-    display_str.push_str(&format!("{}{}", sign, change));
-  }
-  Ok(display_str)
-}
-
-pub fn try_decode_snapshot(
-  uid: i64,
-  object_id: &str,
-  data: &[u8],
-) -> Result<String, PersistenceError> {
-  let mut decoded_str = String::new();
-  match {
-    let mut wrapper = AssertUnwindSafe(&mut decoded_str);
-    panic::catch_unwind(move || {
-      let collab = Collab::new(uid, object_id, "1", vec![]);
-      if let Ok(update) = Update::decode_v1(data) {
-        let mut txn = collab.origin_transact_mut();
-        txn.apply_update(update);
-        drop(txn);
-      }
-      **wrapper = collab.to_plain_text();
-    })
-  } {
-    Ok(_) => Ok(decoded_str),
-    Err(e) => Err(PersistenceError::InvalidData(format!("{:?}", e))),
+    state.store(next_state as u8, Ordering::Release);
+    result
   }
 }

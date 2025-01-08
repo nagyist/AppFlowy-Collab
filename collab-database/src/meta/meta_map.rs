@@ -1,28 +1,38 @@
+use collab::preclude::{Any, Map, MapRef, ReadTxn, TransactionMut};
+use collab_entity::define::DATABASE_INLINE_VIEW;
 use std::ops::Deref;
-
-use collab::preclude::{MapRef, MapRefExtension, MapRefWrapper, ReadTxn, TransactionMut};
-
-const DATABASE_INLINE_VIEW: &str = "iid";
+use tracing::error;
 
 pub struct MetaMap {
-  container: MapRefWrapper,
+  container: MapRef,
 }
 
 impl MetaMap {
-  pub fn new(container: MapRefWrapper) -> Self {
+  pub fn new(container: MapRef) -> Self {
     Self { container }
   }
 
   /// Set the inline view id
-  pub fn set_inline_view_with_txn(&self, txn: &mut TransactionMut, view_id: &str) {
+  pub(crate) fn set_inline_view_id(&self, txn: &mut TransactionMut, view_id: &str) {
     self
       .container
-      .insert_str_with_txn(txn, DATABASE_INLINE_VIEW, view_id);
+      .insert(txn, DATABASE_INLINE_VIEW, Any::String(view_id.into()));
   }
 
   /// Get the inline view id
-  pub fn get_inline_view_with_txn<T: ReadTxn>(&self, txn: &T) -> Option<String> {
-    self.container.get_str_with_txn(txn, DATABASE_INLINE_VIEW)
+  pub fn get_inline_view_id<T: ReadTxn>(&self, txn: &T) -> Option<String> {
+    let out = self.container.get(txn, DATABASE_INLINE_VIEW);
+    if out.is_none() {
+      error!("Can't find inline view id");
+    }
+
+    match out?.cast::<String>() {
+      Ok(id) => Some(id),
+      Err(err) => {
+        error!("Failed to cast inline view id: {:?}", err);
+        None
+      },
+    }
   }
 }
 

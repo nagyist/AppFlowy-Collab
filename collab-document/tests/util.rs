@@ -7,37 +7,52 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 
-use collab::preclude::CollabBuilder;
+use collab::core::origin::CollabOrigin;
+use collab::preclude::{Collab, CollabBuilder};
 use collab_document::blocks::{Block, BlockAction, DocumentData, DocumentMeta};
 use collab_document::document::Document;
-use collab_document::error::DocumentError;
+use collab_entity::CollabType;
 use collab_plugins::local_storage::rocksdb::rocksdb_plugin::RocksdbDiskPlugin;
+use collab_plugins::local_storage::rocksdb::util::KVDBCollabPersistenceImpl;
 use collab_plugins::CollabKVDB;
 use nanoid::nanoid;
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::TempDir;
 use tracing_subscriber::{fmt::Subscriber, util::SubscriberInitExt, EnvFilter};
+use uuid::Uuid;
 use zip::ZipArchive;
 
 pub struct DocumentTest {
+  pub workspace_id: String,
   pub document: Document,
   pub db: Arc<CollabKVDB>,
 }
 
 impl DocumentTest {
-  pub async fn new(uid: i64, doc_id: &str) -> Self {
+  pub fn new(uid: i64, doc_id: &str) -> Self {
+    let workspace_id = Uuid::new_v4().to_string();
     let db = document_storage();
-    Self::new_with_db(uid, doc_id, db).await
+    Self::new_with_db(uid, workspace_id, doc_id, db)
   }
 
-  pub async fn new_with_db(uid: i64, doc_id: &str, db: Arc<CollabKVDB>) -> Self {
-    let disk_plugin = RocksdbDiskPlugin::new(uid, Arc::downgrade(&db), None);
-    let collab = CollabBuilder::new(1, doc_id)
-      .with_plugin(disk_plugin)
+  pub fn new_with_db(uid: i64, workspace_id: String, doc_id: &str, db: Arc<CollabKVDB>) -> Self {
+    let disk_plugin = RocksdbDiskPlugin::new(
+      uid,
+      workspace_id.clone(),
+      doc_id.to_string(),
+      CollabType::Document,
+      Arc::downgrade(&db),
+    );
+    let data_source = KVDBCollabPersistenceImpl {
+      db: Arc::downgrade(&db),
+      uid,
+      workspace_id: workspace_id.clone(),
+    };
+    let collab = CollabBuilder::new(uid, doc_id, data_source.into())
       .with_device_id("1")
+      .with_plugin(disk_plugin)
       .build()
       .unwrap();
-    collab.lock().initialize();
 
     let mut blocks = HashMap::new();
     let mut children_map = HashMap::new();
@@ -88,8 +103,13 @@ impl DocumentTest {
       blocks,
       meta,
     };
-    let document = Document::create_with_data(Arc::new(collab), document_data).unwrap();
-    Self { document, db }
+    let mut document = Document::create_with_data(collab, document_data).unwrap();
+    document.initialize();
+    Self {
+      workspace_id,
+      document,
+      db,
+    }
   }
 }
 
@@ -101,23 +121,39 @@ impl Deref for DocumentTest {
   }
 }
 
-pub async fn open_document_with_db(uid: i64, doc_id: &str, db: Arc<CollabKVDB>) -> Document {
+pub fn open_document_with_db(
+  uid: i64,
+  workspace_id: &str,
+  doc_id: &str,
+  db: Arc<CollabKVDB>,
+) -> Document {
   setup_log();
-  let disk_plugin = RocksdbDiskPlugin::new(uid, Arc::downgrade(&db), None);
-  let collab = CollabBuilder::new(uid, doc_id)
-    .with_plugin(disk_plugin)
+  let disk_plugin = RocksdbDiskPlugin::new(
+    uid,
+    workspace_id.to_string(),
+    doc_id.to_string(),
+    CollabType::Document,
+    Arc::downgrade(&db),
+  );
+  let data_source = KVDBCollabPersistenceImpl {
+    db: Arc::downgrade(&db),
+    uid,
+    workspace_id: workspace_id.to_string(),
+  };
+  let mut collab = CollabBuilder::new(uid, doc_id, data_source.into())
     .with_device_id("1")
+    .with_plugin(disk_plugin)
     .build()
     .unwrap();
-  collab.lock().initialize();
 
-  Document::open(Arc::new(collab)).unwrap()
+  collab.initialize();
+  Document::open(collab).unwrap()
 }
 
 pub fn document_storage() -> Arc<CollabKVDB> {
   let tempdir = TempDir::new().unwrap();
   let path = tempdir.into_path();
-  Arc::new(CollabKVDB::open_opt(path, false).unwrap())
+  Arc::new(CollabKVDB::open(path).unwrap())
 }
 
 fn setup_log() {
@@ -138,14 +174,6 @@ fn setup_log() {
   });
 }
 
-pub fn insert_block(
-  document: &Document,
-  block: Block,
-  prev_id: String,
-) -> Result<Block, DocumentError> {
-  document.with_transact_mut(|txn| document.insert_block(txn, block, Some(prev_id)))
-}
-
 pub fn get_document_data(
   document: &Document,
 ) -> (String, HashMap<String, Block>, HashMap<String, Vec<String>>) {
@@ -159,23 +187,14 @@ pub fn get_document_data(
   (page_id, blocks, children_map)
 }
 
-pub fn delete_block(document: &Document, block_id: &str) -> Result<(), DocumentError> {
-  document.with_transact_mut(|txn| document.delete_block(txn, block_id))
+pub fn apply_actions(document: &mut Document, actions: Vec<BlockAction>) {
+  if let Err(err) = document.apply_action(actions) {
+    // Handle the error
+    tracing::error!("[Document] apply_action error: {:?}", err);
+  }
 }
 
-pub fn update_block(
-  document: &Document,
-  block_id: &str,
-  data: HashMap<String, Value>,
-) -> Result<(), DocumentError> {
-  document.with_transact_mut(|txn| document.update_block_data(txn, block_id, data))
-}
-
-pub fn apply_actions(document: &Document, actions: Vec<BlockAction>) {
-  document.apply_action(actions)
-}
-
-pub fn insert_block_for_page(document: &Document, block_id: String) -> Block {
+pub fn insert_block_for_page(document: &mut Document, block_id: String) -> Block {
   let (page_id, _, _) = get_document_data(document);
   let block = Block {
     id: block_id,
@@ -187,7 +206,7 @@ pub fn insert_block_for_page(document: &Document, block_id: String) -> Block {
     data: Default::default(),
   };
 
-  insert_block(document, block, "".to_string()).unwrap()
+  document.insert_block(block, None).unwrap()
 }
 
 pub struct Cleaner(PathBuf);
@@ -241,4 +260,10 @@ pub fn unzip_history_document_db(folder_name: &str) -> std::io::Result<(Cleaner,
     Cleaner::new(PathBuf::from(output_folder_path)),
     PathBuf::from(path),
   ))
+}
+
+/// Can remove in the future. Just want to test the encode_collab and decode_collab
+pub fn try_decode_from_encode_collab(document: &Document) {
+  let data = document.encode_collab().unwrap();
+  let _ = Collab::new_with_source(CollabOrigin::Empty, "1", data.into(), vec![], false).unwrap();
 }

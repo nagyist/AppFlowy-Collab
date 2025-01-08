@@ -1,9 +1,14 @@
-use collab::core::array_wrapper::ArrayRefExtension;
+use std::collections::HashMap;
+
+use collab::preclude::encoding::serde::from_any;
 use collab::preclude::{
-  Array, ArrayRefWrapper, Change, DeepEventsSubscription, DeepObservable, Event, MapPrelim,
-  YrsValue,
+  Any, Array, ArrayRef, Change, DeepObservable, Event, Map, MapPrelim, MapRef, Out, ReadTxn,
+  Subscription, ToJson, TransactionMut, YrsValue,
 };
-use collab_entity::reminder::{Reminder, REMINDER_ID};
+use collab_entity::reminder::{
+  Reminder, REMINDER_ID, REMINDER_IS_ACK, REMINDER_MESSAGE, REMINDER_META, REMINDER_OBJECT_ID,
+  REMINDER_SCHEDULED_AT, REMINDER_TITLE, REMINDER_TY,
+};
 use tokio::sync::broadcast;
 
 pub type RemindersChangeSender = broadcast::Sender<ReminderChange>;
@@ -16,13 +21,13 @@ pub enum ReminderChange {
 }
 
 pub struct Reminders {
-  pub(crate) container: ArrayRefWrapper,
+  pub(crate) container: ArrayRef,
   #[allow(dead_code)]
-  subscription: Option<DeepEventsSubscription>,
+  subscription: Option<Subscription>,
 }
 
 impl Reminders {
-  pub fn new(mut container: ArrayRefWrapper, change_tx: Option<RemindersChangeSender>) -> Self {
+  pub fn new(mut container: ArrayRef, change_tx: Option<RemindersChangeSender>) -> Self {
     let subscription =
       change_tx.map(|change_tx| subscribe_reminder_change(&mut container, change_tx));
     Self {
@@ -31,43 +36,51 @@ impl Reminders {
     }
   }
 
-  pub fn remove(&self, id: &str) {
-    self.container.with_transact_mut(|txn| {
-      self.container.remove_with_id(txn, id, REMINDER_ID);
-    });
+  fn find<T: ReadTxn>(&self, txn: &T, reminder_id: &str) -> Option<(u32, Out)> {
+    for (i, value) in self.container.iter(txn).enumerate() {
+      if let Out::YMap(map) = &value {
+        if let Some(Out::Any(Any::String(str))) = map.get(txn, REMINDER_ID) {
+          if &*str == reminder_id {
+            return Some((i as u32, value));
+          }
+        }
+      }
+    }
+    None
   }
 
-  pub fn add(&self, reminder: Reminder) {
-    self.container.with_transact_mut(|txn| {
-      let _ = self
-        .container
-        .insert_map_with_txn(txn, Some(reminder.into()));
-    });
+  pub fn remove(&self, txn: &mut TransactionMut, id: &str) {
+    if let Some((i, _value)) = self.find(txn, id) {
+      self.container.remove(txn, i);
+    }
   }
 
-  pub fn update_reminder<F>(&self, reminder_id: &str, f: F)
+  pub fn add(&self, txn: &mut TransactionMut, reminder: Reminder) {
+    let map: MapPrelim = reminder.into();
+    self.container.push_back(txn, map);
+  }
+
+  pub fn update_reminder<F>(&self, txn: &mut TransactionMut, reminder_id: &str, f: F)
   where
-    F: FnOnce(&mut Reminder),
+    F: FnOnce(ReminderUpdate),
   {
-    self.container.with_transact_mut(|txn| {
-      self
-        .container
-        .mut_map_element_with_txn(txn, reminder_id, REMINDER_ID, |txn, map| {
-          let mut reminder = Reminder::try_from((txn, map)).ok()?;
-          f(&mut reminder);
-          Some(MapPrelim::from(reminder))
-        });
-    });
+    if let Some((_, Out::YMap(mut map))) = self.find(txn, reminder_id) {
+      let update = ReminderUpdate {
+        map_ref: &mut map,
+        txn,
+      };
+      f(update)
+    }
   }
 
-  pub fn get_all_reminders(&self) -> Vec<Reminder> {
-    let txn = self.container.transact();
+  pub fn get_all_reminders<T: ReadTxn>(&self, txn: &T) -> Vec<Reminder> {
     self
       .container
-      .iter(&txn)
+      .iter(txn)
       .flat_map(|value| {
-        if let YrsValue::YMap(map) = value {
-          Reminder::try_from((&txn, map)).ok()
+        let json = value.to_json(txn);
+        if let Ok(reminder) = from_any::<Reminder>(&json) {
+          Some(reminder)
         } else {
           None
         }
@@ -92,9 +105,9 @@ impl Reminders {
 /// A `DeepEventsSubscription` that represents the active subscription to the array's changes.
 ///
 fn subscribe_reminder_change(
-  root: &mut ArrayRefWrapper,
+  root: &mut ArrayRef,
   change_tx: RemindersChangeSender,
-) -> DeepEventsSubscription {
+) -> Subscription {
   root.observe_deep(move |txn, events| {
     for event in events.iter() {
       if let Event::Array(array_event) = event {
@@ -123,4 +136,59 @@ fn subscribe_reminder_change(
       }
     }
   })
+}
+
+pub struct ReminderUpdate<'a, 'b> {
+  map_ref: &'a mut MapRef,
+  txn: &'a mut TransactionMut<'b>,
+}
+
+impl<'a, 'b> ReminderUpdate<'a, 'b> {
+  pub fn set_object_id<T: AsRef<str>>(self, value: T) -> Self {
+    self
+      .map_ref
+      .try_update(self.txn, REMINDER_OBJECT_ID, value.as_ref());
+    self
+  }
+
+  pub fn set_title<T: AsRef<str>>(self, value: T) -> Self {
+    self
+      .map_ref
+      .try_update(self.txn, REMINDER_TITLE, value.as_ref());
+    self
+  }
+
+  pub fn set_message<T: AsRef<str>>(self, value: T) -> Self {
+    self
+      .map_ref
+      .try_update(self.txn, REMINDER_MESSAGE, value.as_ref());
+    self
+  }
+
+  pub fn set_is_ack(self, value: bool) -> Self {
+    self.map_ref.try_update(self.txn, REMINDER_IS_ACK, value);
+    self
+  }
+
+  pub fn set_is_read(self, value: bool) -> Self {
+    self.map_ref.try_update(self.txn, REMINDER_IS_ACK, value);
+    self
+  }
+
+  pub fn set_type<T: Into<i64>>(self, value: T) -> Self {
+    self.map_ref.try_update(self.txn, REMINDER_TY, value.into());
+    self
+  }
+
+  pub fn set_scheduled_at<T: Into<i64>>(self, value: T) -> Self {
+    self
+      .map_ref
+      .try_update(self.txn, REMINDER_SCHEDULED_AT, value.into());
+    self
+  }
+
+  pub fn set_meta(self, value: HashMap<String, String>) -> Self {
+    self.map_ref.try_update(self.txn, REMINDER_META, value);
+    self
+  }
 }

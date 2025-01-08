@@ -1,8 +1,11 @@
-use std::fmt::Debug;
-
 use crate::local_storage::kv::keys::*;
 use crate::local_storage::kv::snapshot::SnapshotAction;
 use crate::local_storage::kv::*;
+use smallvec::{smallvec, SmallVec};
+use std::collections::HashSet;
+use std::fmt::Debug;
+use tracing::{error, info};
+use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, TransactionMut, Update};
@@ -15,26 +18,21 @@ where
   fn create_new_doc<K: AsRef<[u8]> + ?Sized + Debug, T: ReadTxn>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     txn: &T,
   ) -> Result<(), PersistenceError> {
-    if self.is_exist(uid, object_id) {
+    if self.is_exist(uid, workspace_id, object_id) {
       tracing::warn!("🟡{:?} already exist", object_id);
       return Err(PersistenceError::DocumentAlreadyExist);
     }
-    let doc_id = get_or_create_did(uid, self, object_id.as_ref())?;
-    tracing::trace!(
-      "[Client {}] => [{}:{:?}]: new doc:{}",
-      uid,
-      doc_id,
-      object_id,
-      doc_id
-    );
+    let doc_id = get_or_create_did(uid, self, workspace_id.as_ref(), object_id.as_ref())?;
     let doc_state = txn.encode_diff_v1(&StateVector::default());
     let sv = txn.state_vector().encode_v1();
     let doc_state_key = make_doc_state_key(doc_id);
     let sv_key = make_state_vector_key(doc_id);
 
+    info!("new doc:{:?}, doc state len:{}", object_id, doc_state.len());
     self.insert(doc_state_key, doc_state)?;
     self.insert(sv_key, sv)?;
 
@@ -51,17 +49,12 @@ where
   fn flush_doc<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     state_vector: Vec<u8>,
     doc_state: Vec<u8>,
   ) -> Result<(), PersistenceError> {
-    let doc_id = get_or_create_did(uid, self, object_id)?;
-    tracing::debug!(
-      "[Client {}] => [{}:{:?}]: flush doc",
-      uid,
-      doc_id,
-      object_id
-    );
+    let doc_id = get_or_create_did(uid, self, workspace_id, object_id)?;
 
     // Remove the updates
     let start = make_doc_start_key(doc_id);
@@ -76,8 +69,13 @@ where
     Ok(())
   }
 
-  fn is_exist<K: AsRef<[u8]> + ?Sized + Debug>(&self, collab_id: i64, object_id: &K) -> bool {
-    get_doc_id(collab_id, self, object_id).is_some()
+  fn is_exist<K: AsRef<[u8]> + ?Sized + Debug>(
+    &self,
+    uid: i64,
+    workspace_id: &K,
+    object_id: &K,
+  ) -> bool {
+    get_doc_id(uid, self, workspace_id, object_id).is_some()
   }
 
   /// Load the document from the database and apply the updates to the transaction.
@@ -89,20 +87,25 @@ where
   fn load_doc_with_txn<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     txn: &mut TransactionMut,
   ) -> Result<u32, PersistenceError> {
     let mut update_count = 0;
 
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let doc_state_key = make_doc_state_key(doc_id);
       if let Some(doc_state) = self.get(doc_state_key.as_ref())? {
         // Load the doc state
-        if let Err(e) = Update::decode_v1(doc_state.as_ref())
-          .map_err(PersistenceError::Yrs)
-          .and_then(|update| txn.try_apply_update(update))
-        {
-          tracing::error!("🔴{:?} apply doc state error: {}", object_id, e)
+
+        match Update::decode_v1(doc_state.as_ref()) {
+          Ok(update) => {
+            txn.try_apply_update(update)?;
+          },
+          Err(err) => {
+            error!("🔴{:?} decode doc state error: {}", object_id, err);
+            return Err(PersistenceError::Yrs(err));
+          },
         }
 
         // If the enable_snapshot is true, we will try to load the snapshot.
@@ -131,73 +134,47 @@ where
           object_id
         );
       }
+
       Ok(update_count)
     } else {
       tracing::trace!("[Client] => {:?} not exist", object_id);
-      Err(PersistenceError::DocumentNotExist)
+      Err(PersistenceError::RecordNotFound(format!(
+        "doc with given object id: {:?} is not found",
+        object_id
+      )))
     }
   }
 
   fn load_doc<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     doc: Doc,
   ) -> Result<u32, PersistenceError> {
     let mut txn = doc.transact_mut();
-    self.load_doc_with_txn(uid, object_id, &mut txn)
+    self.load_doc_with_txn(uid, workspace_id, object_id, &mut txn)
   }
-
-  // fn load_latest_snapshot<K: AsRef<[u8]> + ?Sized + Debug>(
-  //   &self,
-  //   uid: i64,
-  //   object_id: &K,
-  //   txn: &mut TransactionMut,
-  // ) -> Option<Vec<u8>> {
-  //   let snapshot_id = get_snapshot_id(uid, self, object_id)?;
-  //   let snapshot = self.get_last_snapshot_update(snapshot_id)?;
-  //   // Decode the data of the snapshot and apply it to the transaction.
-  //   // If the snapshot is invalid, the snapshot will be deleted. After delete the snapshot,
-  //   // try to load the next latest snapshot.
-  //   match Update::decode_v1(&snapshot.data) {
-  //     Ok(update) => match txn.try_apply_update(update) {
-  //       Ok(_) => {},
-  //       Err(e) => {
-  //         tracing::error!(
-  //           "🔴{:?} apply snapshot error: {}. try to load next snapshot",
-  //           object_id,
-  //           e
-  //         );
-  //         self.delete_last_snapshot_update(snapshot_id);
-  //         return self.load_latest_snapshot(uid, object_id, txn);
-  //       },
-  //     },
-  //     Err(_) => {
-  //       self.delete_last_snapshot_update(snapshot_id);
-  //       tracing::error!(
-  //         "🔴{:?} decode snapshot error, try to load next snapshot",
-  //         object_id
-  //       );
-  //       return self.load_latest_snapshot(uid, object_id, txn);
-  //     },
-  //   }
-  //   Some(snapshot.update_key)
-  // }
 
   /// Push an update to the persistence
   fn push_update<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     update: &[u8],
   ) -> Result<Vec<u8>, PersistenceError> {
-    match get_doc_id(uid, self, object_id.as_ref()) {
+    match get_doc_id(uid, self, workspace_id.as_ref(), object_id.as_ref()) {
       None => {
         tracing::error!(
-          "🔴Insert update failed. Can't find the doc for {:?}",
+          "🔴Insert update failed. Can't find the doc for {}-{:?}",
+          uid,
           object_id
         );
-        Err(PersistenceError::DocumentNotExist)
+        Err(PersistenceError::RecordNotFound(format!(
+          "doc with given object id: {:?} is not found",
+          object_id
+        )))
       },
       Some(doc_id) => insert_doc_update(self, doc_id, object_id, update.to_vec()),
     }
@@ -207,10 +184,11 @@ where
   fn delete_updates_to<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     end: &[u8],
   ) -> Result<(), PersistenceError> {
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let start = make_doc_update_key(doc_id, 0);
       self.remove_range(start.as_ref(), end.as_ref())?;
     }
@@ -220,9 +198,10 @@ where
   fn delete_all_updates<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
   ) -> Result<(), PersistenceError> {
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let start = make_doc_update_key(doc_id, 0);
       let end = make_doc_update_key(doc_id, Clock::MAX);
       self.remove_range(start.as_ref(), end.as_ref())?;
@@ -233,11 +212,12 @@ where
   fn flush_doc_with<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
     doc_state: &[u8],
     sv: &[u8],
   ) -> Result<(), PersistenceError> {
-    let doc_id = get_or_create_did(uid, self, object_id)?;
+    let doc_id = get_or_create_did(uid, self, workspace_id, object_id)?;
     let start = make_doc_start_key(doc_id);
     let end = make_doc_end_key(doc_id);
     self.remove_range(start.as_ref(), end.as_ref())?;
@@ -254,9 +234,10 @@ where
   fn get_all_updates<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
   ) -> Result<Vec<Vec<u8>>, PersistenceError> {
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let start = make_doc_update_key(doc_id, 0);
       let end = make_doc_update_key(doc_id, Clock::MAX);
       let range = self.range(start.as_ref()..end.as_ref())?;
@@ -275,11 +256,16 @@ where
   fn delete_doc<K: AsRef<[u8]> + ?Sized + Debug>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
   ) -> Result<(), PersistenceError> {
-    if let Some(did) = get_doc_id(uid, self, object_id) {
+    if let Some(did) = get_doc_id(uid, self, workspace_id, object_id) {
       tracing::trace!("[Client {}] => [{}] delete {:?} doc", uid, did, object_id);
-      let key = make_doc_id_key(&uid.to_be_bytes(), object_id.as_ref());
+      let key = make_doc_id_key_v1(
+        &uid.to_be_bytes(),
+        workspace_id.as_ref(),
+        object_id.as_ref(),
+      );
       let _ = self.remove(key.as_ref());
 
       // Delete the updates
@@ -309,13 +295,57 @@ where
     Ok(OIDIter { iter })
   }
 
+  fn get_all_object_ids(
+    &self,
+    uid: i64,
+    workspace_id: &str,
+  ) -> Result<impl Iterator<Item = String>, PersistenceError> {
+    let uid_bytes = uid.to_be_bytes();
+    let workspace_bytes = workspace_id.as_bytes();
+
+    // Construct the `from` key with UID and workspace_id
+    let mut from_vec: SmallVec<[u8; 24]> = smallvec![DOC_SPACE, DOC_SPACE_OBJECT];
+    from_vec.extend_from_slice(&uid_bytes);
+    from_vec.extend_from_slice(workspace_bytes);
+    let from = Key(from_vec);
+
+    // Construct the `to` key by appending 0xFF to cover the full range of keys with the same prefix
+    let to_vec: SmallVec<[u8; 24]> = smallvec![DOC_SPACE, DOC_SPACE_OBJECT_KEY];
+    let to = Key(to_vec);
+
+    let iter = self.range(from.as_ref()..to.as_ref())?;
+
+    Ok(iter.filter_map(move |entry| {
+      extract_object_id_from_key_v1(entry.key(), uid_bytes.len(), workspace_bytes.len())
+        .and_then(|object_id_bytes| String::from_utf8(object_id_bytes.to_vec()).ok())
+    }))
+  }
+
+  fn get_all_workspace_ids(&self) -> Result<Vec<String>, PersistenceError> {
+    let from = Key::from_const([DOC_SPACE, DOC_SPACE_OBJECT]);
+    let to = Key::from_const([DOC_SPACE, DOC_SPACE_OBJECT_KEY]);
+    let iter = self.range(from.as_ref()..to.as_ref())?;
+
+    let mut workspace_ids = HashSet::new();
+    // Iterate over the keys and extract workspace IDs
+    for entry in iter {
+      let key_bytes = entry.key();
+      if let Some(workspace_id) = extract_uuid_from_key(key_bytes) {
+        workspace_ids.insert(Uuid::from_bytes(workspace_id).to_string());
+      }
+    }
+
+    Ok(workspace_ids.into_iter().collect())
+  }
+
   /// Return all the updates for the given document
   fn get_decoded_v1_updates<K: AsRef<[u8]> + ?Sized>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
   ) -> Result<Vec<Update>, PersistenceError> {
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let start = make_doc_update_key(doc_id, 0);
       let end = make_doc_update_key(doc_id, Clock::MAX);
 
@@ -327,22 +357,31 @@ where
       }
       Ok(updates)
     } else {
-      Err(PersistenceError::DocumentNotExist)
+      Err(PersistenceError::RecordNotFound(format!(
+        "The document with given object id: {:?} is not found",
+        object_id.as_ref(),
+      )))
     }
   }
 
   fn get_doc_last_update_key<K: AsRef<[u8]> + ?Sized>(
     &self,
     uid: i64,
+    workspace_id: &K,
     object_id: &K,
   ) -> Option<Key<16>> {
-    let doc_id = get_doc_id(uid, self, object_id)?;
+    let doc_id = get_doc_id(uid, self, workspace_id, object_id)?;
     get_last_update_key(self, doc_id, make_doc_update_key).ok()
   }
 
   /// Return the number of updates for the given document
-  fn number_of_updates<K: AsRef<[u8]> + ?Sized>(&self, uid: i64, object_id: &K) -> usize {
-    if let Some(doc_id) = get_doc_id(uid, self, object_id) {
+  fn number_of_updates<K: AsRef<[u8]> + ?Sized>(
+    &self,
+    uid: i64,
+    workspace_id: &K,
+    object_id: &K,
+  ) -> usize {
+    if let Some(doc_id) = get_doc_id(uid, self, workspace_id, object_id) {
       let start = make_doc_update_key(doc_id, 0);
       let end = make_doc_update_key(doc_id, Clock::MAX);
       self
@@ -366,6 +405,7 @@ where
 fn get_or_create_did<'a, K, S>(
   uid: i64,
   store: &S,
+  workspace_id: &K,
   object_id: &K,
 ) -> Result<DocID, PersistenceError>
 where
@@ -373,23 +413,35 @@ where
   PersistenceError: From<<S as KVStore<'a>>::Error>,
   K: AsRef<[u8]> + ?Sized + Debug,
 {
-  if let Some(did) = get_doc_id(uid, store, object_id.as_ref()) {
+  if let Some(did) = get_doc_id(uid, store, workspace_id.as_ref(), object_id.as_ref()) {
     Ok(did)
   } else {
-    let key = make_doc_id_key(&uid.to_be_bytes(), object_id.as_ref());
-    let new_did = make_doc_id_for_key(store, key)?;
+    let key = make_doc_id_key_v1(
+      &uid.to_be_bytes(),
+      workspace_id.as_ref(),
+      object_id.as_ref(),
+    );
+    let new_did = insert_doc_id_for_key(store, key)?;
     Ok(new_did)
   }
 }
 
-fn get_doc_id<'a, K, S>(collab_id: i64, store: &S, object_id: &K) -> Option<DocID>
+fn get_doc_id<'a, K, S>(uid: i64, store: &S, workspace_id: &K, object_id: &K) -> Option<DocID>
 where
   S: KVStore<'a>,
   K: AsRef<[u8]> + ?Sized,
 {
-  let collab_id_bytes = &collab_id.to_be_bytes();
-  let key = make_doc_id_key(collab_id_bytes, object_id.as_ref());
-  get_id_for_key(store, key)
+  let uid_bytes = uid.to_be_bytes();
+
+  // Try to find the new key format first
+  let new_key = make_doc_id_key_v1(&uid_bytes, workspace_id.as_ref(), object_id.as_ref());
+  if let Some(doc_id) = get_id_for_key(store, new_key) {
+    return Some(doc_id);
+  }
+
+  // Fallback to the old key format if not found
+  let old_key = make_doc_id_key_v0(&uid_bytes, object_id.as_ref());
+  get_id_for_key(store, old_key)
 }
 
 pub struct OIDIter<I, E>
@@ -411,5 +463,55 @@ where
     let entry = self.iter.next()?;
     let content = oid_from_key(entry.key());
     Some(String::from_utf8_lossy(content).to_string())
+  }
+}
+fn extract_uuid_from_key(key: &[u8]) -> Option<[u8; 16]> {
+  // Start index is set to skip DOC_SPACE and DOC_SPACE_OBJECT (2 bytes)
+  let start_index = 2;
+  let end_index = start_index + 16;
+  // Ensure the key has enough length for extracting a 16-byte UUID
+  if key.len() >= end_index {
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&key[start_index..end_index]);
+    Some(uuid_bytes)
+  } else {
+    None
+  }
+}
+
+pub fn migrate_old_keys<'a, S>(store: &'a S, workspace_id: &str) -> Result<(), PersistenceError>
+where
+  S: KVStore<'a>,
+  PersistenceError: From<<S as KVStore<'a>>::Error>,
+{
+  let from = Key::from_const([DOC_SPACE, DOC_SPACE_OBJECT]);
+  let to = Key::from_const([DOC_SPACE, DOC_SPACE_OBJECT_KEY]);
+
+  let iter = store.range(from.as_ref()..to.as_ref())?;
+  for entry in iter {
+    let old_key = entry.key();
+    let value = entry.value();
+    let uid = &old_key[2..10];
+    let object_id = &old_key[10..old_key.len() - 1];
+
+    let new_key = make_doc_id_key_v1(uid, workspace_id.as_ref(), object_id);
+    store.insert(new_key, value)?;
+  }
+
+  Ok(())
+}
+
+pub fn extract_object_id_from_key_v1(
+  key: &[u8],
+  uid_len: usize,
+  workspace_id_len: usize,
+) -> Option<&[u8]> {
+  let prefix_len = 2; // DOC_SPACE + DOC_SPACE_OBJECT
+  let start_index = prefix_len + uid_len + workspace_id_len;
+  // Check if the key is long enough to contain an object_id and a terminator
+  if key.len() > start_index && key[key.len() - 1] == TERMINATOR {
+    Some(&key[start_index..key.len() - 1])
+  } else {
+    None
   }
 }

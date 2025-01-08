@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use collab::core::collab::MutexCollab;
-use collab::core::collab_plugin::EncodedCollab;
-use collab::core::origin::CollabOrigin;
 use nanoid::nanoid;
+use uuid::Uuid;
+
+use collab::entity::EncodedCollab;
 
 use crate::blocks::{Block, DocumentData, DocumentMeta};
 use crate::document::Document;
+use crate::error::DocumentError;
 
 pub const PAGE: &str = "page";
 pub const PARAGRAPH_BLOCK_TYPE: &str = "paragraph";
@@ -29,7 +29,7 @@ pub const PARAGRAPH_BLOCK_TYPE: &str = "paragraph";
 /// # Returns
 /// A `DocumentData` instance populated with a single page block and a single child text block.
 ///
-pub fn default_document_data() -> DocumentData {
+pub fn default_document_data(document_id: &str) -> DocumentData {
   let page_type = PAGE.to_string();
   let text_type = PARAGRAPH_BLOCK_TYPE.to_string();
 
@@ -38,8 +38,8 @@ pub fn default_document_data() -> DocumentData {
   let mut text_map: HashMap<String, String> = HashMap::new();
 
   // page block
-  let page_id = generate_id();
-  let children_id = generate_id();
+  let page_id = page_id_from_document_id(document_id).unwrap_or_else(generate_id);
+  let children_id = page_id.clone();
   let root = Block {
     id: page_id.clone(),
     ty: page_type,
@@ -85,13 +85,17 @@ pub fn default_document_data() -> DocumentData {
 
 /// Generates default collab data for a document. This document only contains the initial state
 /// of the document.
-pub fn default_document_collab_data(document_id: &str) -> EncodedCollab {
-  let document_data = default_document_data();
-  let collab = Arc::new(MutexCollab::new(CollabOrigin::Empty, document_id, vec![]));
-  let _ = Document::create_with_data(collab.clone(), document_data);
-  collab.encode_collab_v1()
+pub fn default_document_collab_data(document_id: &str) -> Result<EncodedCollab, DocumentError> {
+  let document_data = default_document_data(document_id);
+  let document = Document::create(document_id, document_data)?;
+  document.encode_collab()
 }
 
 pub fn generate_id() -> String {
   nanoid!(10)
+}
+
+pub fn page_id_from_document_id(document_id: &str) -> Option<String> {
+  let document_uuid = Uuid::parse_str(document_id).ok()?;
+  Some(Uuid::new_v5(&document_uuid, PAGE.as_bytes()).to_string())
 }

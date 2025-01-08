@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
-use collab_document::blocks::{BlockAction, BlockActionPayload, BlockActionType};
+use collab_document::blocks::{Block, BlockAction, BlockActionPayload, BlockActionType};
 use serde_json::json;
 
-use crate::blocks::block_test_core::{BlockTestCore, TEXT_BLOCK_TYPE};
+use crate::blocks::block_test_core::{generate_id, BlockTestCore, TEXT_BLOCK_TYPE};
+use crate::util::try_decode_from_encode_collab;
 
-#[tokio::test]
-async fn create_default_document_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn create_default_document_test() {
+  let test = BlockTestCore::new();
   let document_data = test.get_document_data();
   let page = test.get_page();
   let page_id = page.id.as_str();
@@ -20,22 +21,22 @@ async fn create_default_document_test() {
   assert_eq!(first_block.ty, TEXT_BLOCK_TYPE);
 }
 
-#[tokio::test]
-async fn open_document_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn open_document_test() {
+  let test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
-  let collab = test.collab;
+  let collab = test.document.split().0;
   let test = BlockTestCore::open(collab, test.db);
   let page = test.get_page();
   let reopened_page_id = page.id.as_str();
   assert_eq!(page_id, reopened_page_id);
 }
 
-#[tokio::test]
-async fn subscribe_insert_change_test() {
-  let mut test = BlockTestCore::new().await;
-  test.subscribe(|_e, _| {
+#[test]
+fn subscribe_insert_change_test() {
+  let mut test = BlockTestCore::new();
+  test.subscribe("noop", |_e, _| {
     // do nothing
   });
   let page = test.get_page();
@@ -44,10 +45,10 @@ async fn subscribe_insert_change_test() {
   test.insert_text_block(text, page_id, None);
 }
 
-#[tokio::test]
-async fn subscribe_update_change_test() {
-  let mut test = BlockTestCore::new().await;
-  test.subscribe(|_e, _| {
+#[test]
+fn subscribe_update_change_test() {
+  let mut test = BlockTestCore::new();
+  test.subscribe("noop", |_e, _| {
     // do nothing
   });
   let page = test.get_page();
@@ -57,10 +58,10 @@ async fn subscribe_update_change_test() {
   test.update_block_data(page_id, data);
 }
 
-#[tokio::test]
-async fn subscribe_delete_change_test() {
-  let mut test = BlockTestCore::new().await;
-  test.subscribe(|_e, _| {
+#[test]
+fn subscribe_delete_change_test() {
+  let mut test = BlockTestCore::new();
+  test.subscribe("noop", |_e, _| {
     // do nothing
   });
   let page = test.get_page();
@@ -70,9 +71,9 @@ async fn subscribe_delete_change_test() {
   test.delete_block(first_block_id);
 }
 
-#[tokio::test]
-async fn insert_block_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn insert_block_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let page_children = test.get_block_children(page_id);
@@ -97,9 +98,9 @@ async fn insert_block_test() {
   assert_eq!(original_first_block_id, page_children[1].id.as_str());
 }
 
-#[tokio::test]
-async fn delete_block_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn delete_block_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let text = "Hello World".to_string();
@@ -114,11 +115,12 @@ async fn delete_block_test() {
   test.delete_block(&first_block.id);
   let page_children = test.get_block_children(page_id);
   assert_eq!(page_children.len(), 1);
+  try_decode_from_encode_collab(&test.document);
 }
 
-#[tokio::test]
-async fn move_block_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn move_block_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let text = "Hello World".to_string();
@@ -156,11 +158,13 @@ async fn move_block_test() {
   let page_children = test.get_block_children(page_id);
   assert_eq!(page_children[0].id, first_block_id);
   assert_eq!(page_children[1].id, second_block_id);
+
+  try_decode_from_encode_collab(&test.document);
 }
 
-#[tokio::test]
-async fn update_block_data_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn update_block_data_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let page_children = test.get_block_children(page_id);
@@ -174,11 +178,12 @@ async fn update_block_data_test() {
   expected_data.insert("text".to_string(), json!(update_text));
 
   assert_eq!(block.data, expected_data);
+  try_decode_from_encode_collab(&test.document);
 }
 
-#[tokio::test]
-async fn apply_actions_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn apply_actions_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let text = "Hello World".to_string();
@@ -208,9 +213,9 @@ async fn apply_actions_test() {
   assert_eq!(page_children.len(), 1);
 }
 
-#[tokio::test]
-async fn apply_insert_block_action_without_parent_id_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn apply_insert_block_action_without_parent_id_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let text = "Hello World".to_string();
@@ -221,9 +226,9 @@ async fn apply_insert_block_action_without_parent_id_test() {
   assert_eq!(page_children.len(), 2);
 }
 
-#[tokio::test]
-async fn apply_block_actions_without_block_test() {
-  let test = BlockTestCore::new().await;
+#[test]
+fn apply_block_actions_without_block_test() {
+  let mut test = BlockTestCore::new();
   let page = test.get_page();
   let page_id = page.id.as_str();
   let document_data = test.get_document_data();
@@ -256,4 +261,65 @@ async fn apply_block_actions_without_block_test() {
   test.apply_action(actions);
   // nothing should happen
   assert_eq!(document_data, test.get_document_data());
+  try_decode_from_encode_collab(&test.document);
+}
+
+#[test]
+fn update_external_id_and_external_type_test() {
+  let mut test = BlockTestCore::new();
+  let page = test.get_page();
+  let page_id = page.id.as_str();
+
+  // 1. create a block without external_id and external_type
+  // 2. insert it into the document
+  // 3. update the block's external_id and external_type
+  let block_id = generate_id();
+  let block_without_external_id_and_external_type = Block {
+    id: block_id.clone(),
+    ty: TEXT_BLOCK_TYPE.to_string(),
+    parent: page_id.to_string(),
+    children: generate_id(),
+    external_id: None,
+    external_type: None,
+    data: HashMap::new(),
+  };
+  let insert_payload = BlockActionPayload {
+    block: Some(block_without_external_id_and_external_type.clone()),
+    prev_id: None,
+    parent_id: Some(page_id.to_string()),
+    delta: None,
+    text_id: None,
+  };
+
+  test.apply_action(vec![BlockAction {
+    action: BlockActionType::Insert,
+    payload: insert_payload,
+  }]);
+
+  let block = test.get_block(&block_id);
+  assert_eq!(block.external_id, None);
+  assert_eq!(block.external_type, None);
+
+  let external_id = generate_id();
+  let external_type = "text".to_string();
+  let mut block_with_external_id_and_external_type =
+    block_without_external_id_and_external_type.clone();
+  block_with_external_id_and_external_type.external_id = Some(external_id.clone());
+  block_with_external_id_and_external_type.external_type = Some(external_type.clone());
+  let update_payload = BlockActionPayload {
+    block: Some(block_with_external_id_and_external_type),
+    prev_id: None,
+    parent_id: Some(page_id.to_string()),
+    delta: None,
+    text_id: None,
+  };
+
+  test.apply_action(vec![BlockAction {
+    action: BlockActionType::Update,
+    payload: update_payload,
+  }]);
+
+  let block = test.get_block(&block_id);
+  assert_eq!(block.external_id, Some(external_id));
+  assert_eq!(block.external_type, Some(external_type));
 }

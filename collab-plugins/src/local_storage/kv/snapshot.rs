@@ -4,6 +4,7 @@ use std::panic::AssertUnwindSafe;
 
 use crate::local_storage::kv::keys::*;
 use crate::local_storage::kv::*;
+use collab_entity::CollabType;
 use serde::{Deserialize, Serialize};
 use yrs::updates::encoder::{Encoder, EncoderV1};
 use yrs::{ReadTxn, Snapshot};
@@ -142,7 +143,7 @@ where
       Ok(snapshot_id)
     } else {
       let key = make_snapshot_id_key(&uid.to_be_bytes(), object_id.as_ref());
-      let new_snapshot_id = make_doc_id_for_key(self, key)?;
+      let new_snapshot_id = insert_doc_id_for_key(self, key)?;
       Ok(new_snapshot_id)
     }
   }
@@ -166,7 +167,7 @@ pub fn try_encode_snapshot<T: ReadTxn>(
   snapshot: Snapshot,
 ) -> Result<Vec<u8>, PersistenceError> {
   let mut encoded_data = vec![];
-  match {
+  let result = {
     let mut wrapper = AssertUnwindSafe(&mut encoded_data);
     let wrapper_txn = AssertUnwindSafe(txn);
     panic::catch_unwind(move || {
@@ -176,21 +177,20 @@ pub fn try_encode_snapshot<T: ReadTxn>(
         .unwrap();
       **wrapper = encoder.to_vec();
     })
-  } {
+  };
+  match result {
     Ok(_) => Ok(encoded_data),
     Err(e) => Err(PersistenceError::InvalidData(format!("{:?}", e))),
   }
 }
 
 pub trait SnapshotPersistence: Send + Sync {
-  fn get_snapshots(&self, uid: i64, object_id: &str) -> Vec<CollabSnapshot>;
-
   fn create_snapshot(
     &self,
     uid: i64,
     object_id: &str,
-    title: String,
-    snapshot_data: Vec<u8>,
+    collab_type: &CollabType,
+    encoded_v1: Vec<u8>,
   ) -> Result<(), PersistenceError>;
 }
 
@@ -215,7 +215,6 @@ impl TryFrom<&[u8]> for CollabSnapshot {
   type Error = PersistenceError;
 
   fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-    let value = bincode::deserialize(value)?;
-    Ok(value)
+    Ok(bincode::deserialize(value)?)
   }
 }

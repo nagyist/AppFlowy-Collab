@@ -1,34 +1,30 @@
-use std::sync::Arc;
-
-use collab_database::database::DatabaseData;
-use collab_database::rows::CreateRowParams;
-use serde_json::{json, Value};
-
-use assert_json_diff::assert_json_include;
-use collab_plugins::CollabKVDB;
-
 use crate::database_test::helper::{
   create_database_with_db, restore_database_from_db, DatabaseTest,
 };
 use crate::helper::unzip_history_database_db;
+use assert_json_diff::{assert_json_eq, assert_json_include};
+
+use collab::core::origin::CollabOrigin;
+use collab::entity::EncodedCollab;
+use collab::preclude::Collab;
+use collab_database::rows::CreateRowParams;
+use collab_plugins::CollabKVDB;
+use serde_json::{json, Value};
+use uuid::Uuid;
 
 #[tokio::test]
 async fn restore_row_from_disk_test() {
-  let (db, database_test) = create_database_with_db(1, "1").await;
-  let row_1 = CreateRowParams {
-    id: 1.into(),
-    ..Default::default()
-  };
-  let row_2 = CreateRowParams {
-    id: 2.into(),
-    ..Default::default()
-  };
-  database_test.create_row(row_1.clone()).unwrap();
-  database_test.create_row(row_2.clone()).unwrap();
+  let workspace_id = Uuid::new_v4().to_string();
+  let database_id = uuid::Uuid::new_v4().to_string();
+  let (db, mut database_test) = create_database_with_db(1, &workspace_id, &database_id).await;
+  let row_1 = CreateRowParams::new(1, database_id.clone());
+  let row_2 = CreateRowParams::new(2, database_id.clone());
+  database_test.create_row(row_1.clone()).await.unwrap();
+  database_test.create_row(row_2.clone()).await.unwrap();
   drop(database_test);
 
-  let database_test = restore_database_from_db(1, "1", db);
-  let rows = database_test.get_rows_for_view("v1");
+  let database_test = restore_database_from_db(1, &workspace_id, &database_id, db).await;
+  let rows = database_test.get_rows_for_view("v1").await;
   assert_eq!(rows.len(), 2);
 
   assert!(rows.iter().any(|row| row.id == row_1.id));
@@ -37,82 +33,46 @@ async fn restore_row_from_disk_test() {
 
 #[tokio::test]
 async fn restore_from_disk_test() {
-  let (db, database_test, expected) = create_database_with_view().await;
-  assert_json_include!(actual:database_test.to_json_value(), expected:expected);
-  // assert_json_eq!(expected, database_test.to_json_value());
+  let workspace_id = Uuid::new_v4().to_string();
+  let database_id = Uuid::new_v4().to_string();
+  let (db, database_test) = create_database_with_db(1, &workspace_id, &database_id).await;
+  assert_database_eq(&database_id, database_test).await;
 
   // Restore from disk
-  let database_test = restore_database_from_db(1, "1", db);
-  assert_json_include!(actual:database_test.to_json_value(), expected:expected);
+  let database_test = restore_database_from_db(1, &workspace_id, &database_id, db).await;
+  assert_database_eq(&database_id, database_test).await;
 }
 
 #[tokio::test]
 async fn restore_from_disk_with_different_database_id_test() {
-  let (db, _, _) = create_database_with_view().await;
-  let database_test = restore_database_from_db(1, "1", db);
-  assert_json_include!(
-    expected: json!( {
-      "fields": [],
-      "inline_view": "v1",
-      "rows": [],
-      "views": [
-        {
-          "database_id": "1",
-          "field_orders": [],
-          "filters": [],
-          "group_settings": [],
-          "id": "v1",
-          "layout": 0,
-          "layout_settings": {},
-          "row_orders": [],
-          "sorts": []
-        }
-      ]
-    }),
-    actual: database_test.to_json_value()
-  );
+  let workspace_id = Uuid::new_v4().to_string();
+  let database_id = Uuid::new_v4().to_string();
+  let (db, _) = create_database_with_db(1, &workspace_id, &database_id).await;
+  let database_test = restore_database_from_db(1, &workspace_id, &database_id, db).await;
+
+  assert_database_eq(&database_id, database_test).await;
 }
 
 #[tokio::test]
 async fn restore_from_disk_with_different_uid_test() {
-  let (db, _, _) = create_database_with_view().await;
-  let database_test = restore_database_from_db(1, "1", db);
-  assert_json_include!(
-    expected: json!( {
-      "fields": [],
-      "inline_view": "v1",
-      "rows": [],
-      "views": [
-        {
-          "database_id": "1",
-          "field_orders": [],
-          "filters": [],
-          "group_settings": [],
-          "id": "v1",
-          "layout": 0,
-          "layout_settings": {},
-          "row_orders": [],
-          "sorts": []
-        }
-      ]
-    }),
-    actual: database_test.to_json_value()
-  );
+  let workspace_id = Uuid::new_v4().to_string();
+  let database_id = Uuid::new_v4().to_string();
+  let (db, _) = create_database_with_db(1, &workspace_id, &database_id).await;
+  let database_test = restore_database_from_db(1, &workspace_id, &database_id, db).await;
+
+  assert_database_eq(&database_id, database_test).await;
 }
 
-async fn create_database_with_view() -> (Arc<CollabKVDB>, DatabaseTest, Value) {
-  let (db, database_test) = create_database_with_db(1, "1").await;
-  let expected = json!({
+async fn assert_database_eq(database_id: &str, database_test: DatabaseTest) {
+  let expected = json!( {
     "fields": [],
-    "inline_view": "v1",
     "rows": [],
     "views": [
       {
-        "database_id": "1",
+        "database_id": database_id,
         "field_orders": [],
         "filters": [],
         "group_settings": [],
-        "id": "v1",
         "layout": 0,
         "layout_settings": {},
         "row_orders": [],
@@ -120,22 +80,46 @@ async fn create_database_with_view() -> (Arc<CollabKVDB>, DatabaseTest, Value) {
       }
     ]
   });
-  (db, database_test, expected)
+
+  assert_json_include!(
+    expected: expected,
+    actual: database_test.to_json_value().await
+  );
 }
 
-const HISTORY_DOCUMENT_020: &str = "020_database";
+const HISTORY_DATABASE_020: &str = "020_database";
+
 #[tokio::test]
 async fn open_020_history_database_test() {
-  let (_cleaner, db_path) = unzip_history_database_db(HISTORY_DOCUMENT_020).unwrap();
-  let db = std::sync::Arc::new(CollabKVDB::open_opt(db_path, false).unwrap());
+  let workspace_id = Uuid::new_v4().to_string();
+  let (_cleaner, db_path) = unzip_history_database_db(HISTORY_DATABASE_020).unwrap();
+  let db = std::sync::Arc::new(CollabKVDB::open(db_path).unwrap());
   let database_test = restore_database_from_db(
     221439819971039232,
+    &workspace_id,
     "c0e69740-49f0-4790-a488-702e2750ba8d",
     db,
-  );
-  let data = database_test.duplicate_database();
+  )
+  .await;
+  let actual_1 = database_test.to_json_value().await;
+  assert_json_include!(expected: expected_json(), actual: actual_1);
 
-  let json_value = json!({
+  let bytes = std::fs::read("./tests/history_database/database_020_encode_collab").unwrap();
+  let encode_collab = EncodedCollab::decode_from_bytes(&bytes).unwrap();
+  let restored_database_collab = Collab::new_with_source(
+    CollabOrigin::Empty,
+    "c0e69740-49f0-4790-a488-702e2750ba8d",
+    encode_collab.into(),
+    vec![],
+    false,
+  )
+  .unwrap();
+  let actual_2 = restored_database_collab.to_json_value();
+  assert_json_eq!(expected_database_json(), actual_2);
+}
+
+fn expected_json() -> Value {
+  json!({
     "fields": [
       {
         "field_type": 0,
@@ -146,9 +130,7 @@ async fn open_020_history_database_test() {
           "0": {
             "data": ""
           }
-        },
-        "visibility": true,
-        "width": 150
+        }
       },
       {
         "field_type": 3,
@@ -159,9 +141,7 @@ async fn open_020_history_database_test() {
           "3": {
             "content": "{\"options\":[{\"id\":\"jydv\",\"name\":\"3\",\"color\":\"LightPink\"},{\"id\":\"F2ew\",\"name\":\"2\",\"color\":\"Pink\"},{\"id\":\"hUJE\",\"name\":\"1\",\"color\":\"Purple\"}],\"disable_color\":false}"
           }
-        },
-        "visibility": true,
-        "width": 150
+        }
       },
       {
         "field_type": 5,
@@ -172,9 +152,7 @@ async fn open_020_history_database_test() {
           "5": {
             "is_selected": false
           }
-        },
-        "visibility": true,
-        "width": 150
+        }
       },
       {
         "field_type": 1,
@@ -195,9 +173,7 @@ async fn open_020_history_database_test() {
             "scale": 0,
             "symbol": "RUB"
           }
-        },
-        "visibility": true,
-        "width": 120
+        }
       },
       {
         "field_type": 6,
@@ -214,9 +190,7 @@ async fn open_020_history_database_test() {
             "content": "",
             "url": ""
           }
-        },
-        "visibility": true,
-        "width": 120
+        }
       },
       {
         "field_type": 8,
@@ -237,9 +211,7 @@ async fn open_020_history_database_test() {
             "time_format": 0,
             "timezone_id": ""
           }
-        },
-        "visibility": true,
-        "width": 120
+        }
       }
     ],
     "rows": [
@@ -271,8 +243,9 @@ async fn open_020_history_database_test() {
           }
         },
         "height": 60,
-        "id": "3a4bcc31-6f6d-46eb-8040-20d228d9f6ca",
-        "timestamp": 1690641126,
+        "id": "bbd404d8-1319-4e4d-84fe-1052c57fe3e7",
+        "created_at": 1690639659,
+        "modified_at": 1690639678,
         "visibility": true
       },
       {
@@ -303,8 +276,9 @@ async fn open_020_history_database_test() {
           }
         },
         "height": 60,
-        "id": "1460c28e-d3ad-4260-8170-b7affb5ec8dd",
-        "timestamp": 1690641126,
+        "id": "bcfe322e-6272-4ed3-a57e-09645ec1073a",
+        "created_at": 1690639659,
+        "modified_at": 1690639679,
         "visibility": true
       },
       {
@@ -335,97 +309,267 @@ async fn open_020_history_database_test() {
           }
         },
         "height": 60,
-        "id": "981a4e66-1506-483f-9c4d-691bd16feeb4",
-        "timestamp": 1690641126,
+        "id": "5d4418d2-621a-4ac5-ad05-e2c6fcc1bc79",
+        "created_at": 1690639659,
+        "modified_at": 1690639679,
         "visibility": true
       }
     ],
-    "view": {
-      "created_at": 1690639659,
-      "database_id": "1b176b8a-a210-4dc6-887b-8fb08d39e621",
-      "field_orders": [
-        {
-          "id": "E_50ji"
+    "views": [
+      {
+        "created_at": 1690639659,
+        "database_id": "c0e69740-49f0-4790-a488-702e2750ba8d",
+        "field_orders": [
+          {
+            "id": "E_50ji"
+          },
+          {
+            "id": "8tbGTb"
+          },
+          {
+            "id": "e-5TiR"
+          },
+          {
+            "id": "QfCqmc"
+          },
+          {
+            "id": "vdCF8I"
+          },
+          {
+            "id": "9U02fU"
+          }
+        ],
+        "filters": [
+          {
+            "condition": 2,
+            "content": "",
+            "field_id": "E_50ji",
+            "id": "OWu470",
+            "ty": 0
+          }
+        ],
+        "group_settings": [],
+        "id": "b44b2906-4508-4532-ad9e-2cf33ceae304",
+        "layout": 0,
+        "layout_settings": {},
+        "modified_at": 1690639708,
+        "name": "Untitled",
+        "row_orders": [
+          {
+            "height": 60,
+            "id": "bbd404d8-1319-4e4d-84fe-1052c57fe3e7"
+          },
+          {
+            "height": 60,
+            "id": "bcfe322e-6272-4ed3-a57e-09645ec1073a"
+          },
+          {
+            "height": 60,
+            "id": "5d4418d2-621a-4ac5-ad05-e2c6fcc1bc79"
+          }
+        ],
+        "sorts": [
+            {
+              "condition": 0,
+              "field_id": "E_50ji",
+              "id": "s:4SJjUs",
+              "ty": 0
+            }
+          ],
+          "field_settings": {}
+      }
+    ]
+  })
+}
+
+fn expected_database_json() -> Value {
+  json!({
+    "database": {
+      "fields": {
+        "8tbGTb": {
+          "created_at": 1690639659,
+          "id": "8tbGTb",
+          "is_primary": false,
+          "last_modified": 1690639667,
+          "name": "Type",
+          "ty": 3,
+          "type_option": {
+            "3": {
+              "content": "{\"options\":[{\"id\":\"jydv\",\"name\":\"3\",\"color\":\"LightPink\"},{\"id\":\"F2ew\",\"name\":\"2\",\"color\":\"Pink\"},{\"id\":\"hUJE\",\"name\":\"1\",\"color\":\"Purple\"}],\"disable_color\":false}"
+            }
+          },
+          "visibility": true,
+          "width": 150
         },
-        {
-          "id": "8tbGTb"
+        "9U02fU": {
+          "created_at": 1690639699,
+          "id": "9U02fU",
+          "is_primary": false,
+          "last_modified": 1690639702,
+          "name": "Text",
+          "ty": 8,
+          "type_option": {
+            "0": {
+              "data": "",
+              "date_format": 3,
+              "field_type": 8,
+              "time_format": 0,
+              "timezone_id": ""
+            },
+            "8": {
+              "date_format": 3,
+              "field_type": 8,
+              "time_format": 0,
+              "timezone_id": ""
+            }
+          },
+          "visibility": true,
+          "width": 120
         },
-        {
-          "id": "e-5TiR"
+        "E_50ji": {
+          "created_at": 1690639659,
+          "id": "E_50ji",
+          "is_primary": true,
+          "last_modified": 1690639659,
+          "name": "Name",
+          "ty": 0,
+          "type_option": {
+            "0": {
+              "data": ""
+            }
+          },
+          "visibility": true,
+          "width": 150
         },
-        {
-          "id": "QfCqmc"
+        "QfCqmc": {
+          "created_at": 1690639671,
+          "id": "QfCqmc",
+          "is_primary": false,
+          "last_modified": 1690639680,
+          "name": "Text",
+          "ty": 1,
+          "type_option": {
+            "0": {
+              "data": "",
+              "format": 0,
+              "name": "Number",
+              "scale": 0,
+              "symbol": "RUB"
+            },
+            "1": {
+              "format": 1,
+              "name": "Number",
+              "scale": 0,
+              "symbol": "RUB"
+            }
+          },
+          "visibility": true,
+          "width": 120
         },
-        {
-          "id": "vdCF8I"
+        "e-5TiR": {
+          "created_at": 1690639659,
+          "id": "e-5TiR",
+          "is_primary": false,
+          "last_modified": 1690639659,
+          "name": "Done",
+          "ty": 5,
+          "type_option": {
+            "5": {
+              "is_selected": false
+            }
+          },
+          "visibility": true,
+          "width": 150
         },
-        {
-          "id": "9U02fU"
+        "vdCF8I": {
+          "created_at": 1690639694,
+          "id": "vdCF8I",
+          "is_primary": false,
+          "last_modified": 1690639697,
+          "name": "Text",
+          "ty": 6,
+          "type_option": {
+            "0": {
+              "content": "",
+              "data": "",
+              "url": ""
+            },
+            "6": {
+              "content": "",
+              "url": ""
+            }
+          },
+          "visibility": true,
+          "width": 120
         }
-      ],
-      "filters": [
-        {
-          "condition": 2,
-          "content": "",
-          "field_id": "E_50ji",
-          "id": "OWu470",
-          "ty": 0
+      },
+      "id": "c0e69740-49f0-4790-a488-702e2750ba8d",
+      "metas": {
+        "iid": "b44b2906-4508-4532-ad9e-2cf33ceae304"
+      },
+      "views": {
+        "b44b2906-4508-4532-ad9e-2cf33ceae304": {
+          "created_at": 1690639659,
+          "database_id": "c0e69740-49f0-4790-a488-702e2750ba8d",
+          "field_orders": [
+            {
+              "id": "E_50ji"
+            },
+            {
+              "id": "8tbGTb"
+            },
+            {
+              "id": "e-5TiR"
+            },
+            {
+              "id": "QfCqmc"
+            },
+            {
+              "id": "vdCF8I"
+            },
+            {
+              "id": "9U02fU"
+            }
+          ],
+          "filters": [
+            {
+              "condition": 2,
+              "content": "",
+              "field_id": "E_50ji",
+              "id": "OWu470",
+              "ty": 0
+            }
+          ],
+          "groups": [],
+          "id": "b44b2906-4508-4532-ad9e-2cf33ceae304",
+          "layout": 0,
+          "layout_settings": {},
+          "modified_at": 1690639708,
+          "name": "Untitled",
+          "row_orders": [
+            {
+              "height": 60,
+              "id": "bbd404d8-1319-4e4d-84fe-1052c57fe3e7"
+            },
+            {
+              "height": 60,
+              "id": "bcfe322e-6272-4ed3-a57e-09645ec1073a"
+            },
+            {
+              "height": 60,
+              "id": "5d4418d2-621a-4ac5-ad05-e2c6fcc1bc79"
+            }
+          ],
+          "sorts": [
+            {
+              "condition": 0,
+              "field_id": "E_50ji",
+              "id": "s:4SJjUs",
+              "ty": 0
+            }
+          ]
         }
-      ],
-      "group_settings": [],
-      "id": "v:pwLq8L",
-      "layout": 0,
-      "layout_settings": {},
-      "modified_at": 1690639708,
-      "name": "Untitled",
-      "row_orders": [
-        {
-          "height": 60,
-          "id": "bbd404d8-1319-4e4d-84fe-1052c57fe3e7"
-        },
-        {
-          "height": 60,
-          "id": "bcfe322e-6272-4ed3-a57e-09645ec1073a"
-        },
-        {
-          "height": 60,
-          "id": "5d4418d2-621a-4ac5-ad05-e2c6fcc1bc79"
-        }
-      ],
-      "sorts": [
-        {
-          "condition": 0,
-          "field_id": "E_50ji",
-          "id": "s:4SJjUs",
-          "ty": 0
-        }
-      ],
-      "field_settings": {}
+      }
     }
-  });
-  let expected_data: DatabaseData = serde_json::from_value(json_value).unwrap();
-  assert_eq!(data.rows.len(), expected_data.rows.len());
-  assert_eq!(data.fields.len(), expected_data.fields.len());
-  assert_eq!(data.view.name, expected_data.view.name);
-  assert_eq!(data.view.layout, expected_data.view.layout);
-  assert_eq!(
-    data.view.layout_settings,
-    expected_data.view.layout_settings
-  );
-  assert_eq!(data.view.filters.len(), expected_data.view.filters.len());
-  assert_eq!(data.view.sorts.len(), expected_data.view.sorts.len());
-  assert_eq!(
-    data.view.group_settings.len(),
-    expected_data.view.group_settings.len()
-  );
-  assert_eq!(
-    data.view.field_orders.len(),
-    expected_data.view.field_orders.len()
-  );
-  assert_eq!(
-    data.view.row_orders.len(),
-    expected_data.view.row_orders.len()
-  );
-  assert_eq!(data.view.modified_at, expected_data.view.modified_at);
-  assert_eq!(data.view.created_at, expected_data.view.created_at);
+  })
 }

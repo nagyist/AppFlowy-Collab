@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use anyhow::Result;
-use collab::preclude::{Any, MapPrelim, MapRef, MapRefExtension, ReadTxn, TransactionMut};
+use collab::preclude::{Any, In, Map, MapExt, MapPrelim, MapRef, Out, ReadTxn, TransactionMut};
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
 
@@ -23,7 +23,7 @@ pub struct Reminder {
   pub object_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize_repr, Deserialize_repr)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize_repr, Deserialize_repr, Copy)]
 #[repr(i64)]
 pub enum ObjectType {
   Unknown = 0,
@@ -37,6 +37,16 @@ impl From<i64> for ObjectType {
       1 => ObjectType::Document,
       2 => ObjectType::Database,
       _ => ObjectType::Unknown,
+    }
+  }
+}
+
+impl From<ObjectType> for i64 {
+  fn from(value: ObjectType) -> Self {
+    match value {
+      ObjectType::Unknown => 0,
+      ObjectType::Document => 1,
+      ObjectType::Database => 2,
     }
   }
 }
@@ -166,34 +176,37 @@ pub const REMINDER_MESSAGE: &str = "message";
 pub const REMINDER_META: &str = "meta";
 
 fn reminder_from_map<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Result<Reminder> {
-  let id = map_ref
-    .get_str_with_txn(txn, REMINDER_ID)
+  let id: String = map_ref
+    .get_with_txn(txn, REMINDER_ID)
     .ok_or(anyhow::anyhow!("{} not found", REMINDER_ID))?;
-  let object_id = map_ref
-    .get_str_with_txn(txn, REMINDER_OBJECT_ID)
+  let object_id: String = map_ref
+    .get_with_txn(txn, REMINDER_OBJECT_ID)
     .ok_or(anyhow::anyhow!("{} not found", REMINDER_OBJECT_ID))?;
-  let scheduled_at = map_ref
-    .get_i64_with_txn(txn, REMINDER_SCHEDULED_AT)
+  let scheduled_at: i64 = map_ref
+    .get_with_txn(txn, REMINDER_SCHEDULED_AT)
     .ok_or(anyhow::anyhow!("{} not found", REMINDER_SCHEDULED_AT))?;
-  let is_ack = map_ref
-    .get_bool_with_txn(txn, REMINDER_IS_ACK)
+  let is_ack: bool = map_ref
+    .get_with_txn(txn, REMINDER_IS_ACK)
     .ok_or(anyhow::anyhow!("{} not found", REMINDER_IS_ACK))?;
-  let is_read = map_ref
-    .get_bool_with_txn(txn, REMINDER_IS_READ)
+  let is_read: bool = map_ref
+    .get_with_txn(txn, REMINDER_IS_READ)
     .unwrap_or_default();
-  let ty = map_ref
-    .get_i64_with_txn(txn, REMINDER_TY)
+  let ty: i64 = map_ref
+    .get_with_txn(txn, REMINDER_TY)
     .ok_or(anyhow::anyhow!("{} not found", REMINDER_TY))?;
-  let title = map_ref
-    .get_str_with_txn(txn, REMINDER_TITLE)
+  let title: String = map_ref
+    .get_with_txn(txn, REMINDER_TITLE)
     .unwrap_or_default();
-  let message = map_ref
-    .get_str_with_txn(txn, REMINDER_MESSAGE)
+  let message: String = map_ref
+    .get_with_txn(txn, REMINDER_MESSAGE)
     .unwrap_or_default();
 
   let meta = map_ref
-    .get_any_with_txn(txn, REMINDER_META)
-    .map(ReminderMeta::from)
+    .get(txn, REMINDER_META)
+    .map(|value| match value {
+      Out::Any(any) => ReminderMeta::from(any),
+      _ => ReminderMeta::default(),
+    })
     .unwrap_or_default();
 
   Ok(Reminder {
@@ -209,32 +222,54 @@ fn reminder_from_map<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Result<Reminder> 
   })
 }
 
-impl From<Reminder> for MapPrelim<Any> {
+impl From<Reminder> for MapPrelim {
   fn from(item: Reminder) -> Self {
-    let mut map = HashMap::new();
-    map.insert(REMINDER_ID.to_string(), Any::String(Arc::from(item.id)));
-    map.insert(
-      REMINDER_OBJECT_ID.to_string(),
-      Any::String(Arc::from(item.object_id)),
-    );
-    map.insert(
-      REMINDER_SCHEDULED_AT.to_string(),
-      Any::BigInt(item.scheduled_at),
-    );
-    map.insert(REMINDER_IS_ACK.to_string(), Any::Bool(item.is_ack));
-    map.insert(REMINDER_IS_READ.to_string(), Any::Bool(item.is_read));
-    map.insert(REMINDER_TY.to_string(), Any::BigInt(item.ty as i64));
-    map.insert(
-      REMINDER_TITLE.to_string(),
-      Any::String(Arc::from(item.title)),
-    );
-    map.insert(
-      REMINDER_MESSAGE.to_string(),
-      Any::String(Arc::from(item.message)),
-    );
+    MapPrelim::from([
+      (REMINDER_ID, In::from(item.id)),
+      (REMINDER_OBJECT_ID, item.object_id.into()),
+      (REMINDER_SCHEDULED_AT, Any::BigInt(item.scheduled_at).into()),
+      (REMINDER_IS_ACK, item.is_ack.into()),
+      (REMINDER_IS_READ, item.is_read.into()),
+      (REMINDER_TY, Any::BigInt(item.ty as i64).into()),
+      (REMINDER_TITLE, item.title.into()),
+      (REMINDER_MESSAGE, item.message.into()),
+      (REMINDER_META, Any::from(item.meta).into()),
+    ])
+  }
+}
 
-    map.insert(REMINDER_META.to_string(), item.meta.into());
+#[cfg(test)]
+mod test {
+  use crate::reminder::{ObjectType, Reminder};
+  use collab::preclude::encoding::serde::from_any;
+  use collab::preclude::{Doc, Map, MapPrelim, ToJson, Transact};
 
-    MapPrelim::from(map)
+  #[test]
+  fn legacy_reminder_conversion() {
+    let doc = Doc::with_client_id(1);
+    let map = doc.get_or_insert_map("reminders");
+    let now = 1718262382723;
+    let reminder = Reminder::new(
+      "test-id".into(),
+      "object-id".into(),
+      now,
+      ObjectType::Document,
+    );
+    let prelim: MapPrelim = reminder.into();
+    let mut tx = doc.transact_mut();
+    map.insert(&mut tx, "reminder", prelim);
+
+    let value = map.get(&tx, "reminder").unwrap();
+    let json = value.to_json(&tx);
+    let reminder: Reminder = from_any(&json).unwrap();
+    assert_eq!(
+      reminder,
+      Reminder::new(
+        "test-id".into(),
+        "object-id".into(),
+        now,
+        ObjectType::Document,
+      )
+    );
   }
 }

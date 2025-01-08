@@ -7,7 +7,6 @@ use std::sync::Arc;
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use yrs::types::Value;
 use yrs::{Any, Array, Map, MapRef, ReadTxn, TransactionMut};
 
 use crate::preclude::{JsonValue, MapRefExtension, YrsValue};
@@ -259,6 +258,7 @@ impl AnyMap {
     }
   }
 
+  /// Insert the content of [AnyMap] into the input map_ref
   pub fn fill_map_ref(self, txn: &mut TransactionMut, map_ref: &MapRef) {
     self.0.iter().for_each(|(k, v)| match v {
       Any::Array(array) => {
@@ -308,10 +308,10 @@ impl<T: ReadTxn> From<(&'_ T, &MapRef)> for AnyMap {
     let (txn, map_ref) = params;
     let mut this = AnyMap::default();
     map_ref.iter(txn).for_each(|(k, v)| match v {
-      Value::Any(any) => {
+      YrsValue::Any(any) => {
         this.insert(k.to_string(), any);
       },
-      Value::YMap(map) => {
+      YrsValue::YMap(map) => {
         let map = map
           .iter(txn)
           .flat_map(|(inner_k, inner_v)| {
@@ -324,7 +324,7 @@ impl<T: ReadTxn> From<(&'_ T, &MapRef)> for AnyMap {
           .collect::<HashMap<String, Any>>();
         this.insert(k.to_string(), Any::Map(Arc::new(map)));
       },
-      Value::YArray(array) => {
+      YrsValue::YArray(array) => {
         let array = array
           .iter(txn)
           .flat_map(|v| {

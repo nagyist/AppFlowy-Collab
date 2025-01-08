@@ -1,36 +1,59 @@
-use std::sync::Arc;
+use crate::core::awareness::{AwarenessUpdate, Event};
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use serde_repr::*;
+
+use std::sync::Arc;
+use tracing::trace;
 use yrs::{Doc, TransactionMut};
 
-use crate::core::awareness::Awareness;
 use crate::core::origin::CollabOrigin;
+use crate::entity::EncodedCollab;
+use crate::error::CollabError;
+use crate::preclude::Collab;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum CollabPluginType {
   /// The plugin is used for sync data with a remote storage. Only one plugin of this type can be
   /// used per document.
   CloudStorage,
   /// The default plugin type. It can be used for any other purpose.
-  Other,
+  Other(String),
+}
+pub trait CollabPersistence: Send + Sync + 'static {
+  fn load_collab_from_disk(&self, collab: &mut Collab) -> Result<(), CollabError>;
+  fn save_collab_to_disk(
+    &self,
+    object_id: &str,
+    encoded_collab: EncodedCollab,
+  ) -> Result<(), CollabError>;
 }
 
-#[async_trait]
+impl<T> CollabPersistence for Box<T>
+where
+  T: CollabPersistence,
+{
+  fn load_collab_from_disk(&self, collab: &mut Collab) -> Result<(), CollabError> {
+    (**self).load_collab_from_disk(collab)
+  }
+
+  fn save_collab_to_disk(
+    &self,
+    object_id: &str,
+    encoded_collab: EncodedCollab,
+  ) -> Result<(), CollabError> {
+    (**self).save_collab_to_disk(object_id, encoded_collab)
+  }
+}
+
 pub trait CollabPlugin: Send + Sync + 'static {
   /// Called when the plugin is initialized.
   /// The will apply the updates to the current [TransactionMut] which will restore the state of
   /// the document.
-  #[cfg(not(feature = "async-plugin"))]
   fn init(&self, _object_id: &str, _origin: &CollabOrigin, _doc: &Doc) {}
 
-  #[cfg(feature = "async-plugin")]
-  async fn init(&self, _object_id: &str, _origin: &CollabOrigin, _doc: &Doc) {}
-
   /// Called when the plugin is initialized.
-  fn did_init(&self, _awareness: &Awareness, _object_id: &str, _last_sync_at: i64) {}
+  fn did_init(&self, _collab: &Collab, _object_id: &str) {}
 
   /// Called when the plugin receives an update. It happens after the [TransactionMut] commit to
   /// the Yrs document.
@@ -40,173 +63,347 @@ pub trait CollabPlugin: Send + Sync + 'static {
   /// We use the [CollabOrigin] to know if the update comes from the local user or from a remote
   fn receive_local_update(&self, _origin: &CollabOrigin, _object_id: &str, _update: &[u8]) {}
 
+  fn receive_local_state(
+    &self,
+    _origin: &CollabOrigin,
+    _object_id: &str,
+    _event: &Event,
+    _update: &AwarenessUpdate,
+  ) {
+  }
+
   /// Called after each [TransactionMut]
   fn after_transaction(&self, _object_id: &str, _txn: &mut TransactionMut) {}
 
   /// Returns the type of the plugin.
-  fn plugin_type(&self) -> CollabPluginType {
-    CollabPluginType::Other
-  }
-
-  /// Notifies the plugin that the collab object has been reset. It happens when the collab object
-  /// is ready to sync from the remote. When reset is called, the plugin should reset its state.
-  fn reset(&self, _object_id: &str) {}
+  fn plugin_type(&self) -> CollabPluginType;
 
   /// Flush the data to the storage. It will remove all existing updates and insert the state vector
   /// and doc_state.
-  fn flush(&self, _object_id: &str, _doc: &Doc) {}
+
+  fn start_init_sync(&self) {}
+
+  /// Called when the plugin is removed
+  fn destroy(&self) {}
 }
 
 /// Implement the [CollabPlugin] trait for Box<T> and Arc<T> where T implements CollabPlugin.
+///
+/// A limitation of manually implementing traits for Arc<T> is that any default methods in the trait
+/// must also be explicitly implemented for Arc<T>. If not, Arc<T> will default to using the trait's
+/// default method implementations, even if the underlying type T has its own specific implementations
 #[async_trait]
 impl<T> CollabPlugin for Box<T>
 where
   T: CollabPlugin,
 {
-  #[cfg(not(feature = "async-plugin"))]
   fn init(&self, object_id: &str, origin: &CollabOrigin, doc: &Doc) {
     (**self).init(object_id, origin, doc);
   }
 
-  #[cfg(feature = "async-plugin")]
-  async fn init(&self, object_id: &str, origin: &CollabOrigin, doc: &Doc) {
-    (**self).init(object_id, origin, doc).await;
-  }
-
-  fn did_init(&self, _awareness: &Awareness, _object_id: &str, last_sync_at: i64) {
-    (**self).did_init(_awareness, _object_id, last_sync_at)
+  fn did_init(&self, collab: &Collab, _object_id: &str) {
+    (**self).did_init(collab, _object_id)
   }
 
   fn receive_update(&self, object_id: &str, txn: &TransactionMut, update: &[u8]) {
     (**self).receive_update(object_id, txn, update)
   }
-}
 
-#[async_trait]
-impl<T> CollabPlugin for Arc<T>
-where
-  T: CollabPlugin,
-{
-  #[cfg(not(feature = "async-plugin"))]
-  fn init(&self, object_id: &str, origin: &CollabOrigin, doc: &Doc) {
-    (**self).init(object_id, origin, doc);
+  fn receive_local_update(&self, origin: &CollabOrigin, object_id: &str, update: &[u8]) {
+    (**self).receive_local_update(origin, object_id, update)
+  }
+  fn receive_local_state(
+    &self,
+    origin: &CollabOrigin,
+    object_id: &str,
+    event: &Event,
+    update: &AwarenessUpdate,
+  ) {
+    (**self).receive_local_state(origin, object_id, event, update)
   }
 
-  #[cfg(feature = "async-plugin")]
-  async fn init(&self, object_id: &str, origin: &CollabOrigin, doc: &Doc) {
-    (**self).init(object_id, origin, doc).await;
+  fn after_transaction(&self, object_id: &str, txn: &mut TransactionMut) {
+    (**self).after_transaction(object_id, txn)
+  }
+  fn plugin_type(&self) -> CollabPluginType {
+    (**self).plugin_type()
   }
 
-  fn did_init(&self, _awareness: &Awareness, _object_id: &str, last_sync_at: i64) {
-    (**self).did_init(_awareness, _object_id, last_sync_at)
+  fn start_init_sync(&self) {
+    (**self).start_init_sync()
   }
 
-  fn receive_update(&self, object_id: &str, txn: &TransactionMut, update: &[u8]) {
-    (**self).receive_update(object_id, txn, update)
+  fn destroy(&self) {
+    (**self).destroy()
   }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
-pub struct EncodedCollab {
-  pub state_vector: Bytes,
-  pub doc_state: Bytes,
-  #[serde(default)]
-  pub version: EncoderVersion,
+#[derive(Clone, Default)]
+pub struct Plugins(pub(crate) Arc<PluginsInner>);
+#[derive(Default)]
+pub(crate) struct PluginsInner {
+  head: ArcSwapOption<Node>,
 }
 
-#[derive(Default, Serialize_repr, Deserialize_repr, Eq, PartialEq, Debug, Clone)]
-#[repr(u8)]
-pub enum EncoderVersion {
-  #[default]
-  V1 = 0,
-  V2 = 1,
+struct Node {
+  next: ArcSwapOption<Node>,
+  value: Box<dyn CollabPlugin>,
 }
 
-impl EncodedCollab {
-  pub fn new_v1<T: Into<Bytes>>(state_vector: T, doc_state: T) -> Self {
-    Self {
-      state_vector: state_vector.into(),
-      doc_state: doc_state.into(),
-      version: EncoderVersion::V1,
+impl Plugins {
+  pub fn new<I>(plugins: I) -> Self
+  where
+    I: IntoIterator<Item = Box<dyn CollabPlugin>>,
+  {
+    let list = Plugins(Arc::new(PluginsInner {
+      head: ArcSwapOption::new(None),
+    }));
+    for plugin in plugins {
+      list.push_front(plugin);
+    }
+    list
+  }
+
+  // Check if a CloudStorage plugin exists in the list
+  pub fn has_cloud_plugin(&self) -> bool {
+    let mut current = self.0.head.load_full();
+    while let Some(node) = current {
+      if node.value.plugin_type() == CollabPluginType::CloudStorage {
+        return true; // CloudStorage plugin found
+      }
+      current = node.next.load_full();
+    }
+    false
+  }
+
+  // Remove a plugin based on its type
+  pub fn remove_plugin(&self, plugin_type: CollabPluginType) {
+    let inner = &*self.0;
+    let mut current = inner.head.load_full();
+    let mut prev: Option<Arc<Node>> = None;
+
+    while let Some(curr_node) = current {
+      if curr_node.value.plugin_type() == plugin_type {
+        let next = curr_node.next.load_full();
+        match prev {
+          Some(prev_node) => {
+            prev_node.next.store(next); // Bypass the current node
+          },
+          None => {
+            inner.head.swap(next); // Removing the head node
+          },
+        }
+
+        trace!("Removed plugin: {:?}", plugin_type);
+        curr_node.value.destroy();
+        return;
+      }
+
+      prev = Some(curr_node.clone());
+      current = curr_node.next.load_full();
     }
   }
 
-  pub fn new_v2<T: Into<Bytes>>(state_vector: T, doc_state: T) -> Self {
-    Self {
-      state_vector: state_vector.into(),
-      doc_state: doc_state.into(),
-      version: EncoderVersion::V2,
+  // Push a plugin to the front of the list
+  pub fn push_front(&self, plugin: Box<dyn CollabPlugin>) -> bool {
+    let inner = &*self.0;
+    if self.contains_plugin(plugin.plugin_type()) {
+      return false;
+    }
+
+    let new_node = Arc::new(Node {
+      next: ArcSwapOption::new(None),
+      value: plugin,
+    });
+
+    inner.head.rcu(|old_head| {
+      new_node.next.store(old_head.clone());
+      Some(new_node.clone())
+    });
+
+    true
+  }
+
+  pub fn contains_plugin(&self, plugin_type: CollabPluginType) -> bool {
+    let mut current = self.0.head.load_full();
+    while let Some(node) = current {
+      if node.value.plugin_type() == plugin_type {
+        return true;
+      }
+      current = node.next.load_full();
+    }
+    false
+  }
+
+  // Remove all plugins from the list
+  pub fn remove_all(&self) -> RemovedPluginsIter {
+    let inner = &*self.0;
+    let current = inner.head.swap(None);
+    RemovedPluginsIter { current }
+  }
+
+  // Iterate over each plugin in the list and apply a function to it
+  pub fn each<F>(&self, mut f: F)
+  where
+    F: FnMut(&Box<dyn CollabPlugin>),
+  {
+    let mut curr = self.0.head.load_full();
+    while let Some(node) = curr {
+      f(&node.value);
+      curr = node.next.load_full();
     }
   }
+}
 
-  pub fn encode_to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-    bincode::serialize(self)
-  }
+pub struct RemovedPluginsIter {
+  current: Option<Arc<Node>>,
+}
 
-  pub fn decode_from_bytes(encoded: &[u8]) -> Result<EncodedCollab, bincode::Error> {
-    // The deserialize_encoded_collab function first tries to deserialize the data as EncodedCollab.
-    // If it fails (presumably because the data was serialized with EncodedCollabV0), it then tries to deserialize as EncodedCollabV0.
-    // After successfully deserializing as EncodedCollabV0, it constructs a new EncodedCollab object with the data from
-    // EncodedCollabV0 and sets the version to a default value.
-    match bincode::deserialize::<EncodedCollab>(encoded) {
-      Ok(new_collab) => Ok(new_collab),
-      Err(_) => {
-        let old_collab: EncodedCollabV0 = bincode::deserialize(encoded)?;
-        Ok(EncodedCollab {
-          state_vector: old_collab.state_vector,
-          doc_state: old_collab.doc_state,
-          version: EncoderVersion::V1,
-        })
+impl Iterator for RemovedPluginsIter {
+  type Item = Box<dyn CollabPlugin>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    match self.current.take() {
+      None => None,
+      Some(node) => {
+        self.current = node.next.load_full();
+        let node = Arc::into_inner(node)?;
+        Some(node.value)
       },
     }
   }
 }
-
-#[derive(Serialize, Deserialize)]
-pub struct EncodedCollabV0 {
-  pub state_vector: Bytes,
-  pub doc_state: Bytes,
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  #[test]
-  fn old_encoded_collab_decoded_into_new_encoded_collab() {
-    let old_encoded_collab = EncodedCollabV0 {
-      state_vector: Bytes::from(vec![1, 2, 3]),
-      doc_state: Bytes::from(vec![4, 5, 6]),
-    };
 
-    let old_encoded_collab_bytes = bincode::serialize(&old_encoded_collab).unwrap();
-    let new_encoded_collab = EncodedCollab::decode_from_bytes(&old_encoded_collab_bytes).unwrap();
+  struct MyPlugin {
+    pub plugin_type: CollabPluginType,
+  }
 
-    assert_eq!(
-      new_encoded_collab,
-      EncodedCollab {
-        state_vector: Bytes::from(vec![1, 2, 3]),
-        doc_state: Bytes::from(vec![4, 5, 6]),
-        version: EncoderVersion::V1,
-      }
-    );
+  impl CollabPlugin for MyPlugin {
+    fn plugin_type(&self) -> CollabPluginType {
+      self.plugin_type.clone()
+    }
+
+    fn destroy(&self) {
+      // In a real implementation, you might want to clean up resources here.
+    }
   }
 
   #[test]
-  fn new_encoded_collab_decoded_into_old_encoded_collab() {
-    let new_encoded_collab = EncodedCollab {
-      state_vector: Bytes::from(vec![1, 2, 3]),
-      doc_state: Bytes::from(vec![4, 5, 6]),
-      version: EncoderVersion::V1,
-    };
+  fn test_push_front_and_contains_plugin() {
+    let plugins = Plugins::new(vec![]);
 
-    let new_encoded_collab_bytes = new_encoded_collab.encode_to_bytes().unwrap();
-    let old_encoded_collab: EncodedCollabV0 =
-      bincode::deserialize(&new_encoded_collab_bytes).unwrap();
+    // Initially, the list should not contain any plugins
+    assert!(!plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(!plugins.contains_plugin(CollabPluginType::CloudStorage));
 
-    assert_eq!(old_encoded_collab.doc_state, new_encoded_collab.doc_state);
-    assert_eq!(
-      old_encoded_collab.state_vector,
-      new_encoded_collab.state_vector
-    );
+    // Add an Other plugin
+    let other_plugin = Box::new(MyPlugin {
+      plugin_type: CollabPluginType::Other("PluginA".to_string()),
+    });
+    assert!(plugins.push_front(other_plugin));
+
+    // The list should now contain the Other plugin
+    assert!(plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(!plugins.contains_plugin(CollabPluginType::CloudStorage));
+
+    // Add a CloudStorage plugin
+    let cloud_plugin = Box::new(MyPlugin {
+      plugin_type: CollabPluginType::CloudStorage,
+    });
+    assert!(plugins.push_front(cloud_plugin));
+
+    // The list should contain both Other and CloudStorage plugins
+    assert!(plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(plugins.contains_plugin(CollabPluginType::CloudStorage));
+
+    // Try to add another CloudStorage plugin (should be rejected)
+    let another_cloud_plugin = Box::new(MyPlugin {
+      plugin_type: CollabPluginType::CloudStorage,
+    });
+    assert!(!plugins.push_front(another_cloud_plugin)); // Should return false
+  }
+
+  #[test]
+  fn test_remove_plugin() {
+    let plugins = Plugins::new(vec![
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::Other("PluginA".to_string()),
+      }) as Box<dyn CollabPlugin>,
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::CloudStorage,
+      }) as Box<dyn CollabPlugin>,
+    ]);
+
+    // The list should contain both Other and CloudStorage plugins
+    assert!(plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(plugins.contains_plugin(CollabPluginType::CloudStorage));
+
+    // Remove the Other plugin
+    plugins.remove_plugin(CollabPluginType::Other("PluginA".to_string()));
+    assert!(!plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(plugins.contains_plugin(CollabPluginType::CloudStorage));
+
+    // Remove the CloudStorage plugin
+    plugins.remove_plugin(CollabPluginType::CloudStorage);
+    assert!(!plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(!plugins.contains_plugin(CollabPluginType::CloudStorage));
+  }
+
+  #[test]
+  fn test_remove_all() {
+    let plugins = Plugins::new(vec![
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::Other("PluginA".to_string()),
+      }) as Box<dyn CollabPlugin>,
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::CloudStorage,
+      }) as Box<dyn CollabPlugin>,
+    ]);
+
+    // The list should contain both Other and CloudStorage plugins
+    assert!(plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(plugins.contains_plugin(CollabPluginType::CloudStorage));
+
+    // Remove all plugins
+    let mut removed_plugins = plugins.remove_all();
+
+    // Check that the removed plugins iterator contains both plugins
+    let removed_plugin_1 = removed_plugins.next().unwrap();
+    let removed_plugin_2 = removed_plugins.next().unwrap();
+    let types: Vec<_> = vec![
+      removed_plugin_1.plugin_type(),
+      removed_plugin_2.plugin_type(),
+    ];
+    assert!(types.contains(&CollabPluginType::Other("PluginA".to_string())));
+    assert!(types.contains(&CollabPluginType::CloudStorage));
+
+    // After removing all, the list should be empty
+    assert!(!plugins.contains_plugin(CollabPluginType::Other("PluginA".to_string())));
+    assert!(!plugins.contains_plugin(CollabPluginType::CloudStorage));
+  }
+
+  #[test]
+  fn test_each() {
+    let plugins = Plugins::new(vec![
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::Other("PluginA".to_string()),
+      }) as Box<dyn CollabPlugin>,
+      Box::new(MyPlugin {
+        plugin_type: CollabPluginType::CloudStorage,
+      }) as Box<dyn CollabPlugin>,
+    ]);
+
+    // Collect all plugin types using the `each` method
+    let mut plugin_types = vec![];
+    plugins.each(|plugin| {
+      plugin_types.push(plugin.plugin_type());
+    });
+
+    // Ensure both Other and CloudStorage plugins were iterated
+    assert!(plugin_types.contains(&CollabPluginType::Other("PluginA".to_string())));
+    assert!(plugin_types.contains(&CollabPluginType::CloudStorage));
   }
 }

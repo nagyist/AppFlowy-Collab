@@ -1,222 +1,29 @@
-use std::collections::HashMap;
-
-use collab::core::any_array::ArrayMapUpdate;
-use collab::core::any_map::AnyMapUpdate;
-use collab::core::value::YrsValueExtension;
-use collab::preclude::map::MapPrelim;
 use collab::preclude::{
-  Any, Array, ArrayRef, Map, MapRef, MapRefExtension, MapRefWrapper, ReadTxn, TransactionMut,
-  YrsValue,
+  Any, Array, ArrayRef, FillRef, Map, MapExt, MapRef, ReadTxn, ToJson, TransactionMut, YrsValue,
 };
-use serde::{Deserialize, Serialize};
+use collab::util::AnyExt;
+use std::collections::HashMap;
+use tracing::trace;
 
-use crate::error::DatabaseError;
-use crate::fields::Field;
-use crate::rows::CreateRowParams;
+use super::CalculationMap;
+
+use crate::entity::{DatabaseView, DatabaseViewMeta};
+
+use crate::views::define::*;
 use crate::views::layout::{DatabaseLayout, LayoutSettings};
 use crate::views::{
-  FieldOrder, FieldOrderArray, FieldSettingsByFieldIdMap, FieldSettingsMap, FilterArray, FilterMap,
+  FieldOrder, FieldOrderArray, FieldSettingsByFieldIdMap, FilterArray, FilterMap,
   GroupSettingArray, GroupSettingMap, LayoutSetting, RowOrder, RowOrderArray, SortArray, SortMap,
 };
 use crate::{impl_any_update, impl_i64_update, impl_order_update, impl_str_update};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct DatabaseView {
-  pub id: String,
-  pub database_id: String,
-  pub name: String,
-  pub layout: DatabaseLayout,
-  pub layout_settings: LayoutSettings,
-  pub filters: Vec<FilterMap>,
-  pub group_settings: Vec<GroupSettingMap>,
-  pub sorts: Vec<SortMap>,
-  pub row_orders: Vec<RowOrder>,
-  pub field_orders: Vec<FieldOrder>,
-  pub field_settings: FieldSettingsByFieldIdMap,
-  pub created_at: i64,
-  pub modified_at: i64,
-}
-
-/// A meta of [DatabaseView]
-#[derive(Debug, Clone)]
-pub struct DatabaseViewMeta {
-  pub id: String,
-  pub name: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CreateViewParams {
-  pub database_id: String,
-  pub view_id: String,
-  pub name: String,
-  pub layout: DatabaseLayout,
-  pub layout_settings: LayoutSettings,
-  pub filters: Vec<FilterMap>,
-  pub groups: Vec<GroupSettingMap>,
-  pub sorts: Vec<SortMap>,
-  pub field_settings: FieldSettingsByFieldIdMap,
-
-  /// When creating a view for a database, it might need to create a new field for the view.
-  /// For example, if the view is calendar view, it must have a date field.
-  pub deps_fields: Vec<Field>,
-
-  /// Each new field in `deps_fields` must also have an associated FieldSettings
-  /// that will be inserted into each view according to the view's layout type
-  pub deps_field_setting: Vec<HashMap<DatabaseLayout, FieldSettingsMap>>,
-}
-
-impl CreateViewParams {
-  pub fn take_deps_fields(
-    &mut self,
-  ) -> (Vec<Field>, Vec<HashMap<DatabaseLayout, FieldSettingsMap>>) {
-    (
-      std::mem::take(&mut self.deps_fields),
-      std::mem::take(&mut self.deps_field_setting),
-    )
-  }
-}
-
-impl CreateViewParams {
-  pub fn new(database_id: String, view_id: String, name: String, layout: DatabaseLayout) -> Self {
-    Self {
-      database_id,
-      view_id,
-      name,
-      layout,
-      ..Default::default()
-    }
-  }
-
-  pub fn with_layout_setting(mut self, layout_setting: LayoutSetting) -> Self {
-    self.layout_settings.insert(self.layout, layout_setting);
-    self
-  }
-
-  pub fn with_filters(mut self, filters: Vec<FilterMap>) -> Self {
-    self.filters = filters;
-    self
-  }
-
-  pub fn with_groups(mut self, groups: Vec<GroupSettingMap>) -> Self {
-    self.groups = groups;
-    self
-  }
-
-  pub fn with_deps_fields(
-    mut self,
-    fields: Vec<Field>,
-    field_settings: Vec<HashMap<DatabaseLayout, FieldSettingsMap>>,
-  ) -> Self {
-    self.deps_fields = fields;
-    self.deps_field_setting = field_settings;
-    self
-  }
-
-  pub fn with_field_settings_map(mut self, field_settings_map: FieldSettingsByFieldIdMap) -> Self {
-    self.field_settings = field_settings_map;
-    self
-  }
-}
-
-pub(crate) struct CreateViewParamsValidator;
-
-impl CreateViewParamsValidator {
-  pub(crate) fn validate(params: CreateViewParams) -> Result<CreateViewParams, DatabaseError> {
-    if params.database_id.is_empty() {
-      return Err(DatabaseError::InvalidDatabaseID("database_id is empty"));
-    }
-
-    if params.view_id.is_empty() {
-      return Err(DatabaseError::InvalidViewID("view_id is empty"));
-    }
-
-    Ok(params)
-  }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CreateDatabaseParams {
-  pub database_id: String,
-  pub view_id: String,
-  pub view_name: String,
-  pub layout: DatabaseLayout,
-  pub layout_settings: LayoutSettings,
-  pub filters: Vec<FilterMap>,
-  pub groups: Vec<GroupSettingMap>,
-  pub sorts: Vec<SortMap>,
-  pub field_settings: FieldSettingsByFieldIdMap,
-  pub created_rows: Vec<CreateRowParams>,
-  pub fields: Vec<Field>,
-}
-
-impl CreateDatabaseParams {
-  pub fn from_view(view: DatabaseView, fields: Vec<Field>, rows: Vec<CreateRowParams>) -> Self {
-    let mut params: Self = view.into();
-    params.fields = fields;
-    params.created_rows = rows;
-    params
-  }
-
-  pub fn split(self) -> (Vec<CreateRowParams>, Vec<Field>, CreateViewParams) {
-    (
-      self.created_rows,
-      self.fields,
-      CreateViewParams {
-        database_id: self.database_id,
-        view_id: self.view_id,
-        name: self.view_name,
-        layout: self.layout,
-        layout_settings: self.layout_settings,
-        filters: self.filters,
-        groups: self.groups,
-        sorts: self.sorts,
-        field_settings: self.field_settings,
-        deps_fields: vec![],
-        deps_field_setting: vec![],
-      },
-    )
-  }
-}
-
-impl From<DatabaseView> for CreateDatabaseParams {
-  fn from(view: DatabaseView) -> Self {
-    Self {
-      database_id: view.database_id,
-      view_id: view.id,
-      view_name: view.name,
-      layout: view.layout,
-      layout_settings: view.layout_settings,
-      filters: view.filters,
-      groups: view.group_settings,
-      sorts: view.sorts,
-      field_settings: view.field_settings,
-      created_rows: vec![],
-      fields: vec![],
-    }
-  }
-}
-
-const VIEW_ID: &str = "id";
-const VIEW_NAME: &str = "name";
-const VIEW_DATABASE_ID: &str = "database_id";
-pub const VIEW_LAYOUT: &str = "layout";
-const VIEW_LAYOUT_SETTINGS: &str = "layout_settings";
-const VIEW_FILTERS: &str = "filters";
-const VIEW_GROUPS: &str = "groups";
-const VIEW_SORTS: &str = "sorts";
-const VIEW_FIELD_SETTINGS: &str = "field_settings";
-pub const ROW_ORDERS: &str = "row_orders";
-pub const FIELD_ORDERS: &str = "field_orders";
-const VIEW_CREATE_AT: &str = "created_at";
-const VIEW_MODIFY_AT: &str = "modified_at";
-
 pub struct ViewBuilder<'a, 'b> {
-  map_ref: MapRefWrapper,
+  map_ref: MapRef,
   txn: &'a mut TransactionMut<'b>,
 }
 
 impl<'a, 'b> ViewBuilder<'a, 'b> {
-  pub fn new(txn: &'a mut TransactionMut<'b>, map_ref: MapRefWrapper) -> Self {
+  pub fn new(txn: &'a mut TransactionMut<'b>, map_ref: MapRef) -> Self {
     Self { map_ref, txn }
   }
 
@@ -251,7 +58,12 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   }
 
   pub fn set_view_id(self, view_id: &str) -> Self {
-    self.map_ref.insert_str_with_txn(self.txn, VIEW_ID, view_id);
+    self.map_ref.insert(self.txn, VIEW_ID, view_id);
+    self
+  }
+
+  pub fn set_is_inline(self, is_inline: bool) -> Self {
+    self.map_ref.insert(self.txn, IS_INLINE, is_inline);
     self
   }
 
@@ -268,7 +80,7 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   impl_any_update!(
     set_layout_type,
     set_layout_type_if_not_none,
-    VIEW_LAYOUT,
+    DATABASE_VIEW_LAYOUT,
     DatabaseLayout
   );
 
@@ -278,7 +90,7 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
     move_row_order,
     insert_row_order,
     iter_mut_row_order,
-    ROW_ORDERS,
+    DATABASE_VIEW_ROW_ORDERS,
     RowOrder,
     RowOrderArray
   );
@@ -289,16 +101,14 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
     move_field_order,
     insert_field_order,
     iter_mut_field_order,
-    FIELD_ORDERS,
+    DATABASE_VIEW_FIELD_ORDERS,
     FieldOrder,
     FieldOrderArray
   );
 
   /// Set layout settings of the current view
   pub fn set_layout_settings(self, layout_settings: LayoutSettings) -> Self {
-    let map_ref = self
-      .map_ref
-      .get_or_create_map_with_txn(self.txn, VIEW_LAYOUT_SETTINGS);
+    let map_ref: MapRef = self.map_ref.get_or_init(self.txn, VIEW_LAYOUT_SETTINGS);
     layout_settings.fill_map_ref(self.txn, &map_ref);
     self
   }
@@ -311,31 +121,40 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
     layout_ty: &DatabaseLayout,
     layout_setting: LayoutSetting,
   ) -> Self {
-    let layout_settings = self
-      .map_ref
-      .get_or_create_map_with_txn(self.txn, VIEW_LAYOUT_SETTINGS);
-
-    let layout_setting_map =
-      layout_settings.get_or_create_map_with_txn(self.txn, layout_ty.as_ref());
-    layout_setting.fill_map_ref(self.txn, &layout_setting_map);
+    let layout_settings: MapRef = self.map_ref.get_or_init(self.txn, VIEW_LAYOUT_SETTINGS);
+    let layout_setting_map: MapRef = layout_settings.get_or_init(self.txn, layout_ty.as_ref());
+    Any::from(layout_setting)
+      .fill(self.txn, &layout_setting_map)
+      .unwrap();
     self
   }
 
   /// Remove layout setting for the given [DatabaseLayout]
   pub fn remove_layout_setting(self, layout_ty: &DatabaseLayout) -> Self {
-    let layout_settings = self
-      .map_ref
-      .get_or_create_map_with_txn(self.txn, VIEW_LAYOUT_SETTINGS);
-
+    let layout_settings: MapRef = self.map_ref.get_or_init(self.txn, VIEW_LAYOUT_SETTINGS);
     layout_settings.remove(self.txn, layout_ty.as_ref());
     self
+  }
+
+  /// Update calculations
+  pub fn update_calculations<F>(mut self, f: F) -> Self
+  where
+    F: FnOnce(&mut TransactionMut, ArrayRef),
+  {
+    let array_ref = self.get_calculations_array();
+    f(self.txn, array_ref);
+    self
+  }
+
+  fn get_calculations_array(&mut self) -> ArrayRef {
+    self.map_ref.get_or_init(self.txn, VIEW_CALCULATIONS)
   }
 
   /// Set filters of the current view
   pub fn set_filters(mut self, filters: Vec<FilterMap>) -> Self {
     let array_ref = self.get_filter_array();
-    let filter_array = FilterArray::from_any_maps(filters);
-    filter_array.set_array_ref(self.txn, array_ref);
+    let filter_array: FilterArray = filters.into_iter().map(Any::from).collect();
+    Any::from(filter_array).fill(self.txn, &array_ref).unwrap();
     self
   }
 
@@ -343,19 +162,20 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   /// The given function, [ArrayMapUpdate], which can be used to update the filters
   pub fn update_filters<F>(mut self, f: F) -> Self
   where
-    F: FnOnce(ArrayMapUpdate),
+    F: FnOnce(&mut TransactionMut, ArrayRef),
   {
     let array_ref = self.get_filter_array();
-    let update = ArrayMapUpdate::new(self.txn, array_ref);
-    f(update);
+    f(self.txn, array_ref);
     self
   }
 
   /// Set groups of the current view
   pub fn set_groups(mut self, group_settings: Vec<GroupSettingMap>) -> Self {
     let array_ref = self.get_group_array();
-    let group_settings = GroupSettingArray::from_any_maps(group_settings);
-    group_settings.set_array_ref(self.txn, array_ref);
+    let group_settings: GroupSettingArray = group_settings.into_iter().map(Any::from).collect();
+    Any::from(group_settings)
+      .fill(self.txn, &array_ref)
+      .unwrap();
     self
   }
 
@@ -363,19 +183,18 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   /// The given function, [ArrayMapUpdate], which can be used to update the groups
   pub fn update_groups<F>(mut self, f: F) -> Self
   where
-    F: FnOnce(ArrayMapUpdate),
+    F: FnOnce(&mut TransactionMut, ArrayRef),
   {
     let array_ref = self.get_group_array();
-    let update = ArrayMapUpdate::new(self.txn, array_ref);
-    f(update);
+    f(self.txn, array_ref);
     self
   }
 
   /// Set sorts of the current view
   pub fn set_sorts(mut self, sorts: Vec<SortMap>) -> Self {
     let array_ref = self.get_sort_array();
-    let sort_array = SortArray::from_any_maps(sorts);
-    sort_array.set_array_ref(self.txn, array_ref);
+    let sort_array: SortArray = sorts.into_iter().map(Any::from).collect();
+    Any::from(sort_array).fill(self.txn, &array_ref).unwrap();
     self
   }
 
@@ -383,11 +202,10 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   /// The given function, [ArrayMapUpdate], which can be used to update the sorts
   pub fn update_sorts<F>(mut self, f: F) -> Self
   where
-    F: FnOnce(ArrayMapUpdate),
+    F: FnOnce(&mut TransactionMut, ArrayRef),
   {
     let array_ref = self.get_sort_array();
-    let update = ArrayMapUpdate::new(self.txn, array_ref);
-    f(update);
+    f(self.txn, array_ref);
     self
   }
 
@@ -400,13 +218,12 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
 
   pub fn update_field_settings_for_fields<F>(mut self, field_ids: Vec<String>, f: F) -> Self
   where
-    F: Fn(&str, AnyMapUpdate, DatabaseLayout),
+    F: Fn(&mut TransactionMut, MapRef, &str, DatabaseLayout),
   {
     let map_ref = self.get_field_settings_map();
     let layout_ty = self.get_layout_setting().unwrap();
     field_ids.iter().for_each(|field_id| {
-      let update = AnyMapUpdate::new(self.txn, &map_ref);
-      f(field_id.as_str(), update, layout_ty);
+      f(self.txn, map_ref.clone(), field_id.as_str(), layout_ty);
     });
     self
   }
@@ -417,28 +234,22 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
     self
   }
 
-  /// Get the sort array for the curent view, used when setting or updating
+  /// Get the sort array for the current view, used when setting or updating
   /// sort array
   fn get_sort_array(&mut self) -> ArrayRef {
-    self
-      .map_ref
-      .get_or_create_array_with_txn::<MapPrelim<Any>>(self.txn, VIEW_SORTS)
+    self.map_ref.get_or_init(self.txn, DATABASE_VIEW_SORTS)
   }
 
-  /// Get the group array for the curent view, used when setting or updating
+  /// Get the group array for the current view, used when setting or updating
   /// group array
   fn get_group_array(&mut self) -> ArrayRef {
-    self
-      .map_ref
-      .get_or_create_array_with_txn::<MapPrelim<Any>>(self.txn, VIEW_GROUPS)
+    self.map_ref.get_or_init(self.txn, DATABASE_VIEW_GROUPS)
   }
 
   /// Get the filter array for the current view, used when setting or updating
   /// filter array
   fn get_filter_array(&mut self) -> ArrayRef {
-    self
-      .map_ref
-      .get_or_create_array_with_txn::<MapPrelim<Any>>(self.txn, VIEW_FILTERS)
+    self.map_ref.get_or_init(self.txn, DATABASE_VIEW_FILTERS)
   }
 
   /// Get the field settings for the current view, used when setting or updating
@@ -446,13 +257,13 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
   fn get_field_settings_map(&mut self) -> MapRef {
     self
       .map_ref
-      .get_or_create_map_with_txn(self.txn, VIEW_FIELD_SETTINGS)
+      .get_or_init(self.txn, DATABASE_VIEW_FIELD_SETTINGS)
   }
 
   fn get_layout_setting(&self) -> Option<DatabaseLayout> {
     self
       .map_ref
-      .get_i64_with_txn(self.txn, VIEW_LAYOUT)
+      .get_with_txn::<_, i64>(self.txn, DATABASE_VIEW_LAYOUT)
       .map(DatabaseLayout::from)
   }
 
@@ -462,52 +273,79 @@ impl<'a, 'b> DatabaseViewUpdate<'a, 'b> {
 }
 
 pub fn view_id_from_map_ref<T: ReadTxn>(map_ref: &MapRef, txn: &T) -> String {
-  map_ref.get_str_with_txn(txn, VIEW_ID).unwrap_or_default()
+  map_ref.get_with_txn(txn, VIEW_ID).unwrap_or_default()
+}
+pub fn view_id_from_value<T: ReadTxn>(value: YrsValue, txn: &T) -> Option<String> {
+  let map_ref: MapRef = value.cast().ok()?;
+  Some(view_id_from_map_ref(&map_ref, txn))
 }
 
 /// Return a [DatabaseViewMeta] from a map ref
 /// A [DatabaseViewMeta] is a subset of a [DatabaseView]
 pub fn view_meta_from_value<T: ReadTxn>(value: YrsValue, txn: &T) -> Option<DatabaseViewMeta> {
-  let map_ref = value.to_ymap()?;
-  let id = map_ref.get_str_with_txn(txn, VIEW_ID)?;
-  let name = map_ref.get_str_with_txn(txn, VIEW_NAME).unwrap_or_default();
-  Some(DatabaseViewMeta { id, name })
+  let map_ref: MapRef = value.cast().ok()?;
+  let id: String = map_ref.get_with_txn(txn, VIEW_ID)?;
+  let name: String = map_ref.get_with_txn(txn, VIEW_NAME).unwrap_or_default();
+  let is_inline = map_ref.get_with_txn(txn, IS_INLINE).unwrap_or_default();
+  Some(DatabaseViewMeta {
+    id,
+    name,
+    is_inline,
+  })
 }
 
 /// Return a [DatabaseView] from a map ref
 pub fn view_from_value<T: ReadTxn>(value: YrsValue, txn: &T) -> Option<DatabaseView> {
-  let map_ref = value.to_ymap()?;
-  view_from_map_ref(map_ref, txn)
+  let map_ref: MapRef = value.cast().ok()?;
+  view_from_map_ref(&map_ref, txn)
+}
+
+fn array_of_maps(array_ref: ArrayRef, txn: &impl ReadTxn) -> Vec<HashMap<String, Any>> {
+  array_ref
+    .to_json(txn)
+    .into_array()
+    .unwrap()
+    .into_iter()
+    .map(|any| any.into_map().unwrap())
+    .collect()
 }
 
 /// Return a list of [GroupSettingMap] from a map ref
 pub fn group_setting_from_map_ref<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Vec<GroupSettingMap> {
   map_ref
-    .get_array_ref_with_txn(txn, VIEW_GROUPS)
-    .map(|array_ref| GroupSettingArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_GROUPS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default()
 }
 
 /// Return a new list of [SortMap]s from a map ref
 pub fn sorts_from_map_ref<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Vec<SortMap> {
   map_ref
-    .get_array_ref_with_txn(txn, VIEW_SORTS)
-    .map(|array_ref| SortArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_SORTS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
+    .unwrap_or_default()
+}
+
+/// Return a new list of [CalculationMap]s from a map ref
+pub fn calculations_from_map_ref<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Vec<CalculationMap> {
+  map_ref
+    .get_with_txn::<_, ArrayRef>(txn, VIEW_CALCULATIONS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default()
 }
 
 /// Return a new list of [FilterMap]s from a map ref
 pub fn filters_from_map_ref<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> Vec<FilterMap> {
   map_ref
-    .get_array_ref_with_txn(txn, VIEW_FILTERS)
-    .map(|array_ref| FilterArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_FILTERS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default()
 }
 
 /// Creates a new layout settings from a map ref
 pub fn layout_setting_from_map_ref<T: ReadTxn>(txn: &T, map_ref: &MapRef) -> LayoutSettings {
   map_ref
-    .get_map_with_txn(txn, VIEW_LAYOUT_SETTINGS)
+    .get_with_txn::<_, MapRef>(txn, VIEW_LAYOUT_SETTINGS)
     .map(|map_ref| LayoutSettings::from_map_ref(txn, map_ref))
     .unwrap_or_default()
 }
@@ -518,64 +356,66 @@ pub fn field_settings_from_map_ref<T: ReadTxn>(
   map_ref: &MapRef,
 ) -> FieldSettingsByFieldIdMap {
   map_ref
-    .get_map_with_txn(txn, VIEW_FIELD_SETTINGS)
+    .get_with_txn::<_, MapRef>(txn, DATABASE_VIEW_FIELD_SETTINGS)
     .map(|map_ref| FieldSettingsByFieldIdMap::from((txn, &map_ref)))
     .unwrap_or_default()
 }
 
 /// Creates a new view from a map ref
 pub fn view_from_map_ref<T: ReadTxn>(map_ref: &MapRef, txn: &T) -> Option<DatabaseView> {
-  let id = map_ref.get_str_with_txn(txn, VIEW_ID)?;
-  let name = map_ref.get_str_with_txn(txn, VIEW_NAME)?;
-  let database_id = map_ref
-    .get_str_with_txn(txn, VIEW_DATABASE_ID)
+  let id: String = map_ref.get_with_txn(txn, VIEW_ID)?;
+  let name: String = map_ref.get_with_txn(txn, VIEW_NAME)?;
+  let database_id: String = map_ref
+    .get_with_txn(txn, VIEW_DATABASE_ID)
     .unwrap_or_default();
   let layout = map_ref
-    .get_i64_with_txn(txn, VIEW_LAYOUT)
+    .get_with_txn::<_, i64>(txn, DATABASE_VIEW_LAYOUT)
     .map(DatabaseLayout::from)?;
 
   let layout_settings = map_ref
-    .get_map_with_txn(txn, VIEW_LAYOUT_SETTINGS)
+    .get_with_txn::<_, MapRef>(txn, VIEW_LAYOUT_SETTINGS)
     .map(|map_ref| LayoutSettings::from_map_ref(txn, map_ref))
     .unwrap_or_default();
 
   let filters = map_ref
-    .get_array_ref_with_txn(txn, VIEW_FILTERS)
-    .map(|array_ref| FilterArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_FILTERS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default();
 
   let group_settings = map_ref
-    .get_array_ref_with_txn(txn, VIEW_GROUPS)
-    .map(|array_ref| GroupSettingArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_GROUPS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default();
 
   let sorts = map_ref
-    .get_array_ref_with_txn(txn, VIEW_SORTS)
-    .map(|array_ref| SortArray::from_array_ref(txn, &array_ref).0)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_SORTS)
+    .map(|array_ref| array_of_maps(array_ref, txn))
     .unwrap_or_default();
 
   let row_orders = map_ref
-    .get_array_ref_with_txn(txn, ROW_ORDERS)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_ROW_ORDERS)
     .map(|array_ref| RowOrderArray::new(array_ref).get_objects_with_txn(txn))
     .unwrap_or_default();
 
   let field_orders = map_ref
-    .get_array_ref_with_txn(txn, FIELD_ORDERS)
+    .get_with_txn::<_, ArrayRef>(txn, DATABASE_VIEW_FIELD_ORDERS)
     .map(|array_ref| FieldOrderArray::new(array_ref).get_objects_with_txn(txn))
     .unwrap_or_default();
 
-  let created_at = map_ref
-    .get_i64_with_txn(txn, VIEW_CREATE_AT)
+  let created_at: i64 = map_ref
+    .get_with_txn(txn, VIEW_CREATE_AT)
     .unwrap_or_default();
 
-  let modified_at = map_ref
-    .get_i64_with_txn(txn, VIEW_MODIFY_AT)
+  let modified_at: i64 = map_ref
+    .get_with_txn(txn, VIEW_MODIFY_AT)
     .unwrap_or_default();
 
   let field_settings = map_ref
-    .get_map_with_txn(txn, VIEW_FIELD_SETTINGS)
+    .get_with_txn::<_, MapRef>(txn, DATABASE_VIEW_FIELD_SETTINGS)
     .map(|map_ref| FieldSettingsByFieldIdMap::from((txn, &map_ref)))
     .unwrap_or_default();
+
+  let is_inline: bool = map_ref.get_with_txn(txn, IS_INLINE).unwrap_or(false);
 
   Some(DatabaseView {
     id,
@@ -591,6 +431,7 @@ pub fn view_from_map_ref<T: ReadTxn>(map_ref: &MapRef, txn: &T) -> Option<Databa
     field_settings,
     created_at,
     modified_at,
+    is_inline,
   })
 }
 
@@ -676,6 +517,13 @@ pub trait OrderArray {
       .collect::<Vec<Self::Object>>()
   }
 
+  fn get_object_at_index<T: ReadTxn>(&self, txn: &T, index: u32) -> Option<Self::Object> {
+    self
+      .array_ref()
+      .get(txn, index)
+      .and_then(|value| self.object_from_value(value, txn))
+  }
+
   fn replace_with_txn(&self, txn: &mut TransactionMut, object: Self::Object) {
     if let Some(pos) =
       self
@@ -707,6 +555,7 @@ pub trait OrderArray {
     let from = self.get_position_with_txn(txn, from_id)?;
     let to = self.get_position_with_txn(txn, to_id)?;
     let to = if from < to { to + 1 } else { to };
+    trace!("Move object from {} to {}", from, to);
     self.array_ref().move_to(txn, from, to);
     None
   }

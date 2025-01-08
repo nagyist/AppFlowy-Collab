@@ -1,3 +1,5 @@
+use collab_entity::CollabValidateError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
   #[error(transparent)]
@@ -35,4 +37,21 @@ pub enum DocumentError {
 
   #[error("Lack of document required data")]
   NoRequiredData,
+
+  #[error("The external id is not found")]
+  ExternalIdIsNotFound,
+
+  #[error("Unable to parse document to plain text")]
+  ParseDocumentError,
+
+  #[error("Unable to parse markdown to document data")]
+  ParseMarkdownError,
+}
+
+impl From<CollabValidateError> for DocumentError {
+  fn from(error: CollabValidateError) -> Self {
+    match error {
+      CollabValidateError::NoRequiredData(_) => DocumentError::NoRequiredData,
+    }
+  }
 }

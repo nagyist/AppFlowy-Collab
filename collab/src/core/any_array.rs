@@ -1,6 +1,5 @@
 use std::ops::{Deref, DerefMut};
 
-use yrs::types::Value;
 use yrs::{Array, ArrayRef, ReadTxn, TransactionMut};
 
 use crate::core::any_map::AnyMap;
@@ -34,7 +33,7 @@ impl ArrayMap {
     let mut any_array = Self::new();
     for value in array_ref.iter(txn) {
       match value {
-        Value::YMap(map_ref) => {
+        YrsValue::YMap(map_ref) => {
           any_array.push(AnyMap::from((txn, &map_ref)));
         },
         _ => debug_assert!(false, "Unsupported type"),
@@ -153,6 +152,16 @@ impl<'a, 'b> ArrayMapUpdate<'a, 'b> {
   /// Checks if an `AnyMap` with a specific ID exists in the array.
   pub fn contains(&self, id: &str) -> bool {
     self.index_of(id).is_some()
+  }
+
+  /// Moves an `AnyMap` from one position to another in the array.
+  pub fn move_to(self, from_id: &str, to_id: &str) {
+    let from_pos = self.index_of(from_id);
+    let to_pos = self.index_of(to_id);
+
+    if let (Some(from), Some(to)) = (from_pos, to_pos) {
+      self.array_ref.move_to(self.txn, from, to)
+    }
   }
 
   /// Returns the index of an `AnyMap` with a specific ID.

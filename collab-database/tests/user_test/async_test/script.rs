@@ -1,15 +1,14 @@
-#![allow(clippy::all)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use collab_database::database::DatabaseData;
+use assert_json_diff::assert_json_include;
 use collab_database::fields::Field;
 use collab_database::rows::CreateRowParams;
 use collab_database::rows::{Cells, CellsBuilder, RowId};
 use collab_database::user::WorkspaceDatabase;
-use collab_database::views::{CreateDatabaseParams, OrderObjectPosition};
+use collab_database::views::{CreateDatabaseParams, CreateViewParams};
 use collab_plugins::local_storage::kv::doc::CollabKVAction;
+use collab_plugins::local_storage::kv::KVTransactionDB;
 use collab_plugins::local_storage::CollabPersistenceConfig;
 use collab_plugins::CollabKVDB;
 use serde_json::Value;
@@ -72,7 +71,7 @@ impl DatabaseTest {
   pub async fn new(config: CollabPersistenceConfig) -> Self {
     let tempdir = TempDir::new().unwrap();
     let db_path = tempdir.into_path();
-    let collab_db = Arc::new(CollabKVDB::open_opt(db_path.clone(), false).unwrap());
+    let collab_db = Arc::new(CollabKVDB::open(db_path.clone()).unwrap());
     let workspace_database =
       workspace_database_with_db(1, Arc::downgrade(&collab_db), Some(config.clone())).await;
     Self {
@@ -81,17 +80,6 @@ impl DatabaseTest {
       db_path,
       config,
     }
-  }
-
-  #[allow(dead_code)]
-  pub async fn get_database_data(&self, database_id: &str) -> DatabaseData {
-    let database = self
-      .workspace_database
-      .get_database(database_id)
-      .await
-      .unwrap();
-    let duplicated_database = database.lock().duplicate_database();
-    duplicated_database
   }
 
   pub async fn run_scripts(&mut self, scripts: Vec<DatabaseScript>) {
@@ -160,8 +148,10 @@ pub async fn run_script(
       let w_database =
         workspace_database_with_db(1, Arc::downgrade(&db), Some(config.clone())).await;
       let database = w_database.get_database(&database_id).await.unwrap();
+
       let actual = database.lock().to_json_value();
-      assert_json_diff::assert_json_include!(actual: actual, expected: expected);
+
+      assert_json_include!(actual: actual, expected: expected);
     },
     DatabaseScript::AssertDatabase {
       database_id,
@@ -190,7 +180,7 @@ pub async fn run_script(
   }
 }
 
-pub fn create_database(database_id: &str) -> CreateDatabaseParams {
+pub(crate) fn create_database(database_id: &str) -> CreateDatabaseParams {
   let row_1 = CreateRowParams {
     id: 1.into(),
     cells: CellsBuilder::new()
@@ -199,9 +189,9 @@ pub fn create_database(database_id: &str) -> CreateDatabaseParams {
       .insert_cell("f3", TestTextCell::from("1f3cell"))
       .build(),
     height: 0,
-    visibility: true,
-    row_position: OrderObjectPosition::default(),
-    timestamp: 0,
+    created_at: 1703772730,
+    modified_at: 1703772762,
+    ..Default::default()
   };
   let row_2 = CreateRowParams {
     id: 2.into(),
@@ -210,9 +200,9 @@ pub fn create_database(database_id: &str) -> CreateDatabaseParams {
       .insert_cell("f2", TestTextCell::from("2f2cell"))
       .build(),
     height: 0,
-    visibility: true,
-    row_position: OrderObjectPosition::default(),
-    timestamp: 0,
+    created_at: 1703772730,
+    modified_at: 1703772762,
+    ..Default::default()
   };
   let row_3 = CreateRowParams {
     id: 3.into(),
@@ -221,9 +211,9 @@ pub fn create_database(database_id: &str) -> CreateDatabaseParams {
       .insert_cell("f3", TestTextCell::from("3f3cell"))
       .build(),
     height: 0,
-    visibility: true,
-    row_position: OrderObjectPosition::default(),
-    timestamp: 0,
+    created_at: 1703772730,
+    modified_at: 1703772762,
+    ..Default::default()
   };
   let field_1 = Field::new("f1".to_string(), "text field".to_string(), 0, true);
   let field_2 = Field::new("f2".to_string(), "single select field".to_string(), 2, true);
@@ -233,15 +223,15 @@ pub fn create_database(database_id: &str) -> CreateDatabaseParams {
 
   CreateDatabaseParams {
     database_id: database_id.to_string(),
-    view_id: "v1".to_string(),
-    view_name: "my first database".to_string(),
-    layout: Default::default(),
-    layout_settings: Default::default(),
-    filters: vec![],
-    groups: vec![],
-    sorts: vec![],
-    field_settings: field_settings_map.into(),
-    created_rows: vec![row_1, row_2, row_3],
+    inline_view_id: "v1".to_string(),
+    views: vec![CreateViewParams {
+      database_id: database_id.to_string(),
+      view_id: "v1".to_string(),
+      name: "my first database view".to_string(),
+      field_settings: field_settings_map,
+      ..Default::default()
+    }],
+    rows: vec![row_1, row_2, row_3],
     fields: vec![field_1, field_2, field_3],
   }
 }
